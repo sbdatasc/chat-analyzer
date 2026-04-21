@@ -699,6 +699,37 @@ function App() {
     };
   }, [workspace, hasArchive, extractionRunning, runExtractionWorker]);
 
+  // Fetch a node's connections whenever the sidebar target changes. MUST
+  // live above all conditional early returns — React relies on a stable hook
+  // count across renders, and putting this below `if (loading) return …`
+  // caused a "rendered more hooks than previous render" crash that blanked
+  // the whole UI.
+  useEffect(() => {
+    if (!selectedSidebarNode || !workspace) {
+      setSidebarDetail(null);
+      return;
+    }
+    let cancelled = false;
+    setSidebarDetailLoading(true);
+    setSidebarDetail(null);
+    invoke("get_node_detail", { workspacePath: workspace, nodeId: selectedSidebarNode.id })
+      .then((res: any) => {
+        if (!cancelled) setSidebarDetail(res);
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          console.warn("get_node_detail failed:", err);
+          setSidebarDetail(null);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setSidebarDetailLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedSidebarNode?.id, workspace]);
+
   async function handleSelectWorkspace() {
     try {
       const selected = await open({
@@ -987,34 +1018,6 @@ function App() {
     }
     setIsChatLoading(false);
   };
-
-  // Whenever the sidebar target changes, fetch the node's connections so the
-  // user can explore what it's linked to without needing to pan the graph.
-  useEffect(() => {
-    if (!selectedSidebarNode || !workspace) {
-      setSidebarDetail(null);
-      return;
-    }
-    let cancelled = false;
-    setSidebarDetailLoading(true);
-    setSidebarDetail(null);
-    invoke("get_node_detail", { workspacePath: workspace, nodeId: selectedSidebarNode.id })
-      .then((res: any) => {
-        if (!cancelled) setSidebarDetail(res);
-      })
-      .catch((err) => {
-        if (!cancelled) {
-          console.warn("get_node_detail failed:", err);
-          setSidebarDetail(null);
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setSidebarDetailLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [selectedSidebarNode?.id, workspace]);
 
   const handleNodeClick = (node: any) => {
     if (node.group === "conversation") {
