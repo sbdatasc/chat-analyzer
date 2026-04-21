@@ -40,10 +40,19 @@ pub async fn get_conversation_workbench(
     let conn = crate::db::open_workspace_db(Path::new(&workspace_path))
         .map_err(|e| e.to_string())?;
 
-    // 1. Fetch messages
+    // 1. Fetch the full conversation — both sides, in order. Previously this
+    // filtered `role = 'user'`, which hid every assistant reply. `is_system=0`
+    // drops the invisible system prompt, and `on_visible_path=1` matches the
+    // extraction pipeline's "what the user actually saw" rule (ignoring dead
+    // branches from edits).
     let mut messages = Vec::new();
     let mut stmt_msgs = conn
-        .prepare("SELECT message_id, role, text_content FROM message_index WHERE conversation_id = ?1 AND role = 'user' ORDER BY create_time ASC")
+        .prepare(
+            "SELECT message_id, role, text_content \
+             FROM message_index \
+             WHERE conversation_id = ?1 AND is_system = 0 AND on_visible_path = 1 \
+             ORDER BY create_time ASC",
+        )
         .map_err(|e| e.to_string())?;
     
     let mut rows_msgs = stmt_msgs.query(params![conversation_id]).map_err(|e| e.to_string())?;

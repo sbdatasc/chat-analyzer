@@ -188,11 +188,119 @@ fn extract_balanced_json_value(text: &str) -> Option<&str> {
     None
 }
 
+/// Normalize common LLM output mistakes so serde_json can accept it:
+/// - Smart / curly quotes → straight quotes (models sometimes emit “ ” around keys/values).
+/// - Trailing commas before `]` or `}` (extremely common from LLMs).
+fn repair_common_json_mistakes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '“' | '”' | '„' | '‟' => out.push('"'),
+            '‘' | '’' | '‚' | '‛' => out.push('\''),
+            _ => out.push(ch),
+        }
+    }
+    // Strip trailing commas in arrays/objects: `,]` → `]`, `,}` → `}`, with
+    // whitespace tolerance. Not a JSON-tokenizer-correct implementation but
+    // sufficient for LLM-emitted payloads which don't use literal `,]` inside
+    // string values.
+    let mut result = String::with_capacity(out.len());
+    let bytes = out.as_bytes();
+    let mut i = 0;
+    let mut in_string = false;
+    let mut escape = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            result.push(b as char);
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_string = true;
+            result.push('"');
+            i += 1;
+            continue;
+        }
+        if b == b',' {
+            let mut j = i + 1;
+            while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\n' || bytes[j] == b'\r' || bytes[j] == b'\t') {
+                j += 1;
+            }
+            if j < bytes.len() && (bytes[j] == b']' || bytes[j] == b'}') {
+                // Skip the comma — the trailing one is what's breaking serde.
+                i += 1;
+                continue;
+            }
+        }
+        result.push(b as char);
+        i += 1;
+    }
+    result
+}
+
+/// Last-resort repair: if the LLM emitted a truncated or unterminated value
+/// (open `{[` with no matching close), append the minimum closing chars
+/// needed so serde_json can at least see a structurally complete value. This
+/// is safe-ish because the caller tolerates missing fields on individual
+/// items — the alternative is the whole conversation failing.
+fn close_unbalanced_json(s: &str) -> String {
+    let mut stack: Vec<char> = Vec::new();
+    let mut in_string = false;
+    let mut escape = false;
+    for ch in s.chars() {
+        if in_string {
+            if escape {
+                escape = false;
+                continue;
+            }
+            match ch {
+                '\\' => escape = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' => {
+                if stack.last().copied() == Some(ch) {
+                    stack.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = s.to_string();
+    // If we ended mid-string, close it first so trailing close chars don't
+    // fall inside the unterminated string.
+    if in_string {
+        out.push('"');
+    }
+    while let Some(closer) = stack.pop() {
+        out.push(closer);
+    }
+    out
+}
+
 fn parse_json_response(text: &str) -> Result<Value> {
-    if let Ok(v) = serde_json::from_str::<Value>(text.trim()) {
+    let trimmed = text.trim();
+
+    // Fast path: well-formed JSON straight from the model.
+    if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
         return Ok(v);
     }
 
+    // Markdown-fenced JSON (```json ... ```).
     for marker in ["```json", "```"] {
         if let Some(start) = text.find(marker) {
             let rest = &text[start + marker.len()..];
@@ -210,9 +318,35 @@ fn parse_json_response(text: &str) -> Result<Value> {
         }
     }
 
+    // Balanced-brace extraction on raw text.
     if let Some(val) = extract_balanced_json_value(text) {
-        return serde_json::from_str::<Value>(val)
-            .map_err(|e| anyhow!("invalid extracted JSON object: {}", e));
+        if let Ok(v) = serde_json::from_str::<Value>(val) {
+            return Ok(v);
+        }
+    }
+
+    // Common-mistake repair pass: smart quotes, trailing commas.
+    let repaired = repair_common_json_mistakes(trimmed);
+    if let Ok(v) = serde_json::from_str::<Value>(&repaired) {
+        return Ok(v);
+    }
+    if let Some(val) = extract_balanced_json_value(&repaired) {
+        if let Ok(v) = serde_json::from_str::<Value>(val) {
+            return Ok(v);
+        }
+    }
+
+    // Last resort: if the response is truncated (open braces/brackets with
+    // no matching closers), append the minimum closers to make it valid.
+    // Saves a conversation from a hard-fail when the model cut off cleanly.
+    let closed = close_unbalanced_json(&repaired);
+    if let Ok(v) = serde_json::from_str::<Value>(&closed) {
+        return Ok(v);
+    }
+    if let Some(val) = extract_balanced_json_value(&closed) {
+        if let Ok(v) = serde_json::from_str::<Value>(val) {
+            return Ok(v);
+        }
     }
 
     Err(anyhow!("no parseable JSON object in model response"))

@@ -59,19 +59,30 @@ export function MappingWorkbench({
       {/* Messages Column (Left) */}
       <div className="flex-[3] flex flex-col border-r border-stone-1 overflow-hidden relative">
         <div className="p-4 border-b border-stone-1 bg-surface-elev flex justify-between items-center z-10 shadow-sm">
-          <h2 className="font-semibold text-lg">Source Document</h2>
-          <span className="text-xs text-text-muted select-all bg-stone-1 px-2 py-1 rounded">{conversationId}</span>
+          <div className="flex flex-col min-w-0">
+            <h2 className="font-semibold text-lg">Conversation</h2>
+            <span className="text-[11px] text-text-muted">{data.messages.length} messages</span>
+          </div>
+          <span className="text-xs text-text-muted select-all bg-stone-1 px-2 py-1 rounded truncate ml-2" title={conversationId}>{conversationId}</span>
         </div>
         <div className="flex-1 overflow-y-auto p-6 flex flex-col gap-4">
-          {data.messages.map((msg: any) => (
-            <div key={msg.message_id} className={`flex flex-col ${msg.role === 'user' ? 'items-end' : 'items-start'}`}>
-              <div className={`px-4 py-2 rounded-lg max-w-[85%] text-sm leading-relaxed ${
-                msg.role === 'user' ? 'bg-stone-1 text-text' : 'text-text'
-              }`}>
-                {msg.text}
+          {data.messages.length === 0 && (
+            <p className="text-sm text-text-muted italic">No messages on the visible path for this conversation.</p>
+          )}
+          {data.messages.map((msg: any) => {
+            const isUser = msg.role === 'user';
+            const roleLabel = isUser ? 'You' : msg.role === 'assistant' ? 'Assistant' : msg.role;
+            return (
+              <div key={msg.message_id} className={`flex flex-col gap-1 ${isUser ? 'items-end' : 'items-start'}`}>
+                <span className="text-[10px] uppercase tracking-wider text-text-muted font-medium">{roleLabel}</span>
+                <div className={`px-4 py-2 rounded-lg max-w-[85%] text-sm leading-relaxed whitespace-pre-wrap break-words ${
+                  isUser ? 'bg-stone-1 text-text' : 'bg-surface-elev border border-stone-1 text-text'
+                }`}>
+                  {msg.text}
+                </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       </div>
 
