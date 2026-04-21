@@ -86,7 +86,7 @@ export function inferCloudProvider(cloud: EndpointConfig | null | undefined): Cl
   return url ? "custom" : "gemini";
 }
 
-function summarizeRoutingFailure(err: unknown): string {
+function analyzeRoutingFailure(err: unknown): { summary: string; stickyBackup: boolean } {
   const text = String(err).replace(/\s+/g, " ").trim();
   const lower = text.toLowerCase();
   const model =
@@ -94,19 +94,66 @@ function summarizeRoutingFailure(err: unknown): string {
     text.match(/model(?:s)?[/"'`\s:]+([^"'`\s,.)\]}]+)/i)?.[1];
 
   if ((lower.includes("http 404") || lower.includes("not found")) && model) {
-    return `That endpoint doesn't have the model "${model}". Pick a model that exists on that provider in Settings -> LLM Routing.`;
+    return {
+      summary: `That endpoint doesn't have the model "${model}". Pick a model that exists on that provider in Settings -> LLM Routing.`,
+      stickyBackup: true,
+    };
   }
-  if (lower.includes("http 401") || lower.includes("unauthorized") || lower.includes("invalid api key")) {
-    return "The primary target rejected its API key. Check Settings -> Cloud.";
+  if (lower.includes("http 404") || lower.includes("not found")) {
+    return {
+      summary: "The primary target returned 404 Not Found. Check the endpoint URL and selected model in Settings -> LLM Routing.",
+      stickyBackup: true,
+    };
+  }
+  if (
+    lower.includes("http 401") ||
+    lower.includes("http 403") ||
+    lower.includes("unauthorized") ||
+    lower.includes("invalid api key")
+  ) {
+    return {
+      summary: "The primary target rejected its API key. Check Settings -> Cloud.",
+      stickyBackup: true,
+    };
   }
   if (lower.includes("http 429") || lower.includes("rate limit") || lower.includes("quota")) {
-    return "The primary target hit a rate limit or quota cap.";
+    return {
+      summary: "The primary target hit a rate limit or quota cap.",
+      stickyBackup: true,
+    };
   }
-  if (lower.includes("connect") || lower.includes("network") || lower.includes("dns") || lower.includes("timed out")) {
-    return "The primary target couldn't be reached over the network.";
+  if (
+    (lower.includes("http 400") || lower.includes("bad request")) &&
+    (lower.includes("response_format") || lower.includes("json_object") || lower.includes("unsupported"))
+  ) {
+    return {
+      summary: "The primary target rejected the requested JSON response format. Pick a compatible model or endpoint in Settings -> LLM Routing.",
+      stickyBackup: true,
+    };
+  }
+  if (
+    lower.includes("error sending request for url") ||
+    lower.includes("network error reaching") ||
+    lower.includes("connect") ||
+    lower.includes("network") ||
+    lower.includes("dns") ||
+    lower.includes("timed out") ||
+    lower.includes("timeout") ||
+    lower.includes("connection reset")
+  ) {
+    return {
+      summary: "The primary target had a temporary network problem.",
+      stickyBackup: false,
+    };
+  }
+  if (lower.includes("foreign key constraint failed") || lower.includes("sqlite") || lower.includes("database")) {
+    return {
+      summary: "The workspace database write failed locally, so switching endpoints will not help.",
+      stickyBackup: false,
+    };
   }
 
-  return text.slice(0, 140);
+  return { summary: text.slice(0, 140), stickyBackup: false };
 }
 
 // #region agent log
@@ -137,6 +184,8 @@ function App() {
   const [hasArchive, setHasArchive] = useState<boolean | null>(null);
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
   const [selectedSidebarNode, setSelectedSidebarNode] = useState<any | null>(null);
+  const [sidebarDetail, setSidebarDetail] = useState<any | null>(null);
+  const [sidebarDetailLoading, setSidebarDetailLoading] = useState(false);
   const [isChatLoading, setIsChatLoading] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [sessionSummary, setSessionSummary] = useState<string | null>(null);
@@ -326,12 +375,13 @@ function App() {
           throw new Error("No embedding model selected. Pick one in Settings → LLM Routing (Embedding).");
         }
 
-        // Sticky fallback: once any worker proves the primary target is
-        // broken, the rest of the run skips straight to the backup. Avoids
-        // N×pending cloud timeouts when the primary is hard-down.
+        // Sticky fallback only after hard endpoint/config failures. Transient
+        // transport misses should use the backup for the current conversation
+        // only, then keep the rest of the queue on the preferred target.
         let usingBackup = false;
         let fallbackNoticed = false;
         let fallbackTriggerError: string | null = null;
+        let transientFallbackNoticed = false;
 
         const runTarget = async (t: Target, id: string) => {
           agentLog("A", "src/App.tsx:runTarget", "invoke_extract_conversation", {
@@ -391,18 +441,31 @@ function App() {
                   isPrimary: !usingBackup && ti === 0,
                 });
                 errs.push(`${t.kind}(${t.model}): ${String(e).slice(0, 300)}`);
-                // First primary-target failure flips the rest of the run to
-                // backup, and surfaces *why* once (not per-conversation).
+                const failurePolicy = analyzeRoutingFailure(e);
+                // Only hard endpoint/config failures flip the rest of the run
+                // to backup. Transient network misses should fall back for the
+                // current conversation only and then keep trying the primary.
                 const isPrimary = !usingBackup && ti === 0;
                 if (isPrimary && configuredTargets.length > 1) {
-                  usingBackup = true;
-                  fallbackTriggerError = `${t.kind}(${t.model}): ${String(e).slice(0, 300)}`;
-                  if (!fallbackNoticed) {
-                    fallbackNoticed = true;
+                  if (failurePolicy.stickyBackup) {
+                    usingBackup = true;
+                    fallbackTriggerError = `${t.kind}(${t.model}): ${String(e).slice(0, 300)}`;
+                    if (!fallbackNoticed) {
+                      fallbackNoticed = true;
+                      setRoutingNotice(
+                        `Primary extraction target failed — switching the rest of this sync to your backup. ${failurePolicy.summary}`
+                      );
+                      agentLog("C", "src/App.tsx:worker", "switched_to_backup", {
+                        conversationId: id,
+                        err: String(e).slice(0, 500),
+                      });
+                    }
+                  } else if (!transientFallbackNoticed) {
+                    transientFallbackNoticed = true;
                     setRoutingNotice(
-                      `Primary extraction target failed — switching the rest of this sync to your backup. ${summarizeRoutingFailure(e)}`
+                      `Primary extraction target failed for one conversation, so this item is trying your backup while the rest of the sync stays on the primary target. ${failurePolicy.summary}`
                     );
-                    agentLog("C", "src/App.tsx:worker", "switched_to_backup", {
+                    agentLog("C", "src/App.tsx:worker", "kept_primary_after_transient_failure", {
                       conversationId: id,
                       err: String(e).slice(0, 500),
                     });
@@ -635,6 +698,37 @@ function App() {
       cancelled = true;
     };
   }, [workspace, hasArchive, extractionRunning, runExtractionWorker]);
+
+  // Fetch a node's connections whenever the sidebar target changes. MUST
+  // live above all conditional early returns — React relies on a stable hook
+  // count across renders, and putting this below `if (loading) return …`
+  // caused a "rendered more hooks than previous render" crash that blanked
+  // the whole UI.
+  useEffect(() => {
+    if (!selectedSidebarNode || !workspace) {
+      setSidebarDetail(null);
+      return;
+    }
+    let cancelled = false;
+    setSidebarDetailLoading(true);
+    setSidebarDetail(null);
+    invoke("get_node_detail", { workspacePath: workspace, nodeId: selectedSidebarNode.id })
+      .then((res: any) => {
+        if (!cancelled) setSidebarDetail(res);
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          console.warn("get_node_detail failed:", err);
+          setSidebarDetail(null);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setSidebarDetailLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedSidebarNode?.id, workspace]);
 
   async function handleSelectWorkspace() {
     try {
@@ -907,9 +1001,20 @@ function App() {
         // lens_path returns { path, strength, graph }; others return GraphData.
         const g = (result as any).graph ?? result;
         setGraphData(g);
+        // If the lens has nothing to show, surface a clear notice instead of
+        // silently blanking the canvas — otherwise these buttons feel broken
+        // when the graph is simply empty (e.g. extraction hasn't finished).
+        const nodeCount = Array.isArray(g?.nodes) ? g.nodes.length : 0;
+        if (nodeCount === 0) {
+          const lensLabel = lensCmd.replace('lens_', '');
+          setRoutingNotice(
+            `No ${lensLabel} data to show yet. Run Sync all in Settings so extraction can populate topics, entities, and concepts first.`
+          );
+        }
       }
     } catch (e) {
       console.error(`${lensCmd} failed:`, e);
+      setRoutingNotice(`${lensCmd.replace('lens_', '')} failed: ${String(e).slice(0, 200)}`);
     }
     setIsChatLoading(false);
   };
@@ -996,10 +1101,10 @@ function App() {
         
         {/* Node Inspector Sidebar */}
         {selectedSidebarNode && (
-          <div className="absolute right-0 top-0 bottom-0 w-64 bg-surface-elev border-l border-stone-2 shadow-xl flex flex-col transition-transform animate-in slide-in-from-right-10 overflow-y-auto">
-            <div className="p-4 border-b border-stone-1 flex items-center justify-between sticky top-0 bg-surface-elev">
-              <h3 className="font-semibold text-text text-sm truncate">{selectedSidebarNode.name}</h3>
-              <button 
+          <div className="absolute right-0 top-0 bottom-0 w-80 bg-surface-elev border-l border-stone-2 shadow-xl flex flex-col transition-transform animate-in slide-in-from-right-10 overflow-y-auto">
+            <div className="p-4 border-b border-stone-1 flex items-center justify-between sticky top-0 bg-surface-elev z-10">
+              <h3 className="font-semibold text-text text-sm truncate" title={selectedSidebarNode.name}>{selectedSidebarNode.name}</h3>
+              <button
                 onClick={() => setSelectedSidebarNode(null)}
                 className="text-text-muted hover:text-text rounded p-1"
               >
@@ -1007,34 +1112,62 @@ function App() {
               </button>
             </div>
             <div className="p-4 flex flex-col gap-4">
-              <div className="flex gap-2 items-center">
+              <div className="flex gap-2 items-center flex-wrap">
                 <span className="text-[10px] font-medium text-surface bg-accent px-2 py-0.5 rounded uppercase tracking-wider">
-                  {selectedSidebarNode.group}
+                  {sidebarDetail?.node_type || selectedSidebarNode.group}
                 </span>
-                {selectedSidebarNode.props?.tier && (
+                {/* Wiki-taxonomy subtype badge (person / tool / book / etc) */}
+                {(sidebarDetail?.subtype || selectedSidebarNode.subtype) && (
+                  <span className="text-[10px] font-medium text-accent border border-accent/40 px-2 py-0.5 rounded tracking-wider uppercase">
+                    {sidebarDetail?.subtype || selectedSidebarNode.subtype}
+                  </span>
+                )}
+                {(sidebarDetail?.tier || selectedSidebarNode.props?.tier) && (
+                  <span className="text-[10px] font-medium text-text-muted border border-stone-2 px-2 py-0.5 rounded tracking-wider uppercase">
+                    Tier {sidebarDetail?.tier || selectedSidebarNode.props?.tier}
+                  </span>
+                )}
+                {sidebarDetail && (
                   <span className="text-[10px] font-medium text-text-muted border border-stone-2 px-2 py-0.5 rounded tracking-wider">
-                    Tier {selectedSidebarNode.props.tier}
+                    {sidebarDetail.incoming_count + sidebarDetail.outgoing_count} connections
                   </span>
                 )}
               </div>
-              
-              {selectedSidebarNode.props?.description && (
+
+              {(sidebarDetail?.description || selectedSidebarNode.props?.description) ? (
                 <div className="text-xs text-text leading-relaxed">
-                  {selectedSidebarNode.props.description}
+                  {sidebarDetail?.description || selectedSidebarNode.props?.description}
                 </div>
+              ) : (
+                <div className="text-xs text-text-muted italic">No extended description available.</div>
               )}
-              
-              {selectedSidebarNode.props?.confidence && (
+
+              {(sidebarDetail?.confidence || selectedSidebarNode.props?.confidence) && (
                 <div className="text-[11px] text-text-muted">
-                  Confidence score: <strong>{selectedSidebarNode.props.confidence}%</strong>
+                  Confidence: <strong>{((sidebarDetail?.confidence ?? selectedSidebarNode.props?.confidence) * (sidebarDetail?.confidence ? 100 : 1)).toFixed(0)}%</strong>
                 </div>
               )}
-              
-              {!selectedSidebarNode.props?.description && (
-                <div className="text-xs text-text-muted italic">
-                  No extended AI description available.
-                </div>
-              )}
+
+              {/* Connections explorer — the missing "what touches this?" piece. */}
+              <div className="flex flex-col gap-2 border-t border-stone-1 pt-3">
+                <h4 className="text-[10px] font-semibold text-text uppercase tracking-wider">Connections</h4>
+                {sidebarDetailLoading && <p className="text-[11px] text-text-muted italic">Loading…</p>}
+                {!sidebarDetailLoading && sidebarDetail && sidebarDetail.neighbors.length === 0 && (
+                  <p className="text-[11px] text-text-muted italic">No connections yet — this node is isolated in the graph.</p>
+                )}
+                {!sidebarDetailLoading && sidebarDetail && sidebarDetail.neighbors.length > 0 && (
+                  <SidebarConnections
+                    neighbors={sidebarDetail.neighbors}
+                    onOpenConversation={(id) => {
+                      setActiveConversationId(id);
+                      setSelectedSidebarNode(null);
+                    }}
+                    onFocusNode={(n) => {
+                      setSelectedSidebarNode({ id: n.id, name: n.name, group: n.node_type });
+                    }}
+                  />
+                )}
+              </div>
             </div>
           </div>
         )}
@@ -1047,6 +1180,106 @@ function App() {
           onClose={() => setActiveConversationId(null)} 
         />
       )}
+    </div>
+  );
+}
+
+// Renders a node's neighbors grouped by (direction, edge type), with clickable
+// rows that jump the user to the connected item. Conversations open the
+// workbench; other nodes swap the inspector over to that node so the user
+// can keep walking the graph without needing to find it visually.
+function SidebarConnections({
+  neighbors,
+  onOpenConversation,
+  onFocusNode,
+}: {
+  neighbors: Array<{ id: string; name: string; node_type: string; subtype?: string | null; edge_type: string; direction: string }>;
+  onOpenConversation: (id: string) => void;
+  onFocusNode: (n: { id: string; name: string; node_type: string; subtype?: string | null }) => void;
+}) {
+  // Friendlier English for the raw edge types coming from the graph schema.
+  const labelFor = (edgeType: string, direction: string): string => {
+    const incoming = direction === 'incoming';
+    switch (edgeType) {
+      case 'mentions':
+        return incoming ? 'Mentioned in' : 'Mentions';
+      case 'discusses':
+        return incoming ? 'Discussed in' : 'Discusses';
+      case 'belongs_to':
+        return incoming ? 'Topic for' : 'Belongs to';
+      case 'uses_pattern':
+        return incoming ? 'Pattern used by' : 'Uses pattern';
+      case 'relates_to':
+        return 'Related';
+      default:
+        return edgeType.replace(/_/g, ' ');
+    }
+  };
+
+  const groups = new Map<string, typeof neighbors>();
+  for (const n of neighbors) {
+    const key = `${n.direction}::${n.edge_type}`;
+    const bucket = groups.get(key);
+    if (bucket) bucket.push(n);
+    else groups.set(key, [n]);
+  }
+  // Order: incoming (things that reference this node) first, because that's
+  // the most common exploration question for an entity ("what chats are about this?").
+  const ordered = Array.from(groups.entries()).sort(([a], [b]) => {
+    if (a.startsWith('incoming::') && !b.startsWith('incoming::')) return -1;
+    if (!a.startsWith('incoming::') && b.startsWith('incoming::')) return 1;
+    return a.localeCompare(b);
+  });
+
+  return (
+    <div className="flex flex-col gap-3">
+      {ordered.map(([key, list]) => {
+        const [dir, etype] = key.split('::');
+        return (
+          <div key={key} className="flex flex-col gap-1">
+            <div className="text-[10px] font-medium text-text-muted uppercase tracking-wider flex items-center justify-between">
+              <span>{labelFor(etype, dir)}</span>
+              <span className="font-mono text-text-muted">{list.length}</span>
+            </div>
+            <div className="flex flex-col gap-0.5">
+              {list.map((n) => (
+                <button
+                  key={`${n.id}-${n.direction}-${n.edge_type}`}
+                  onClick={() =>
+                    n.node_type === 'conversation'
+                      ? onOpenConversation(n.id)
+                      : onFocusNode({ id: n.id, name: n.name, node_type: n.node_type, subtype: n.subtype })
+                  }
+                  className="flex items-center gap-2 text-left text-xs text-text hover:text-accent hover:bg-stone-1 rounded px-1.5 py-1 transition-colors min-w-0"
+                  title={n.subtype ? `${n.name} (${n.subtype})` : n.name}
+                >
+                  <span
+                    className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                      n.node_type === 'conversation'
+                        ? 'bg-stone-3'
+                        : n.node_type === 'topic'
+                          ? 'bg-accent'
+                          : n.node_type === 'entity'
+                            ? 'bg-flag-green'
+                            : n.node_type === 'source'
+                              ? 'bg-flag-red'
+                              : n.node_type === 'concept'
+                                ? 'bg-flag-amber'
+                                : 'bg-stone-2'
+                    }`}
+                  />
+                  <span className="truncate flex-1">{n.name}</span>
+                  {/* subtype (person/tool/book/etc) wins over the generic node_type
+                      label when present — it's the richer answer to "what is this?". */}
+                  <span className="text-[9px] text-text-muted uppercase tracking-wider shrink-0">
+                    {n.subtype || n.node_type}
+                  </span>
+                </button>
+              ))}
+            </div>
+          </div>
+        );
+      })}
     </div>
   );
 }

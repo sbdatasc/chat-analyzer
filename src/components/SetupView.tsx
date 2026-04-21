@@ -261,6 +261,38 @@ export function SetupView({
     }
   }
 
+  const [rebuildBusy, setRebuildBusy] = useState(false);
+  const [rebuildMessage, setRebuildMessage] = useState<string | null>(null);
+
+  async function handleRebuildKg() {
+    if (rebuildBusy || extractionRunning) return;
+    const ok = window.confirm(
+      "Rebuild the entire knowledge graph?\n\n" +
+        "This deletes every topic, concept, entity, and pattern that was extracted, " +
+        "then re-queues every conversation for extraction from scratch. " +
+        "Your imported conversations are NOT touched — you don't need to re-import.\n\n" +
+        "This typically takes a while because every conversation is re-run through the LLM."
+    );
+    if (!ok) return;
+    setRebuildBusy(true);
+    setRebuildMessage(null);
+    try {
+      const res = await invoke<{
+        derived_nodes_deleted: number;
+        edges_deleted: number;
+        parked_deleted: number;
+        conversations_requeued: number;
+      }>("rebuild_knowledge_graph", { workspacePath: workspace });
+      setRebuildMessage(
+        `Rebuilt: cleared ${res.derived_nodes_deleted} derived nodes, ${res.edges_deleted} edges, ${res.parked_deleted} parked items. Re-queued ${res.conversations_requeued} conversations. Starting Sync all…`
+      );
+      if (onSyncAll) onSyncAll();
+    } catch (e) {
+      setRebuildMessage(`Rebuild failed: ${e}`);
+    }
+    setRebuildBusy(false);
+  }
+
   // The Local health probe uses whatever base_url the user has configured.
   // If Local isn't set up at all, the UI surfaces that directly — no silent
   // fallback to a hardcoded localhost.
@@ -775,6 +807,44 @@ export function SetupView({
             )}
           </section>
         )}
+
+        <section className="mt-6 border border-stone-1 rounded-lg p-5 bg-surface-elev flex flex-col gap-3">
+          <div>
+            <h2 className="text-sm font-medium text-text">Knowledge Graph</h2>
+            <p className="text-xs text-text-muted leading-relaxed mt-1">
+              Re-run extraction across your imported conversations. Your ingested chats are never deleted — only the derived topics, concepts, entities, and patterns are.
+            </p>
+          </div>
+          <div className="flex flex-col gap-2 border border-flag-amber/40 rounded p-3 bg-surface">
+            <div>
+              <h3 className="text-xs font-semibold text-flag-amber">Rebuild everything</h3>
+              <p className="text-[11px] text-text-muted leading-relaxed mt-1">
+                Wipe every extracted topic / concept / entity / source / pattern and re-run every conversation through the LLM. Costly — use after a prompt or model change.
+              </p>
+            </div>
+            <button
+              onClick={handleRebuildKg}
+              disabled={rebuildBusy || extractionRunning}
+              title={extractionRunning ? 'Stop the current sync before rebuilding' : undefined}
+              className="bg-surface hover:bg-flag-amber hover:text-surface disabled:opacity-50 disabled:cursor-not-allowed text-flag-amber text-xs px-3 py-2 rounded font-medium transition-colors border border-flag-amber/60 self-start"
+            >
+              {rebuildBusy ? 'Rebuilding…' : 'Rebuild knowledge graph'}
+            </button>
+          </div>
+          {/* Explain *why* the button is disabled so a user who clicks and sees
+              nothing happen knows to stop the sync first. The earlier behavior
+              looked like the button was broken. */}
+          {extractionRunning && !rebuildBusy && (
+            <p className="text-[11px] text-flag-amber leading-relaxed">
+              Sync is currently running — stop it at the top of this page before Rebuilding, so the new queue isn't racing against in-flight workers.
+            </p>
+          )}
+          {rebuildMessage && (
+            <p className="text-[11px] text-text-muted leading-relaxed border-l-2 border-stone-2 pl-2 whitespace-pre-wrap break-words">
+              {rebuildMessage}
+            </p>
+          )}
+        </section>
 
         <section className="mt-8 border border-flag-red/40 rounded-lg p-5 bg-surface-elev">
           <h2 className="text-sm font-medium text-flag-red mb-1">Danger zone</h2>

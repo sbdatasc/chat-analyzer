@@ -502,6 +502,242 @@ pub fn retry_all_failed_extractions_impl(workspace_path: &Path) -> Result<i64, S
     Ok(changed as i64)
 }
 
+#[derive(serde::Serialize)]
+pub struct NodeNeighbor {
+    pub id: String,
+    pub name: String,
+    pub node_type: String,
+    /// Wiki-taxonomy subtype if present (person/tool/book/etc).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subtype: Option<String>,
+    pub edge_type: String,
+    pub direction: &'static str, // "incoming" (edge ends here) or "outgoing" (edge starts here)
+}
+
+#[derive(serde::Serialize)]
+pub struct NodeDetail {
+    pub id: String,
+    pub name: String,
+    pub node_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subtype: Option<String>,
+    pub description: Option<String>,
+    pub tier: Option<String>,
+    pub confidence: Option<f64>,
+    pub incoming_count: i64,
+    pub outgoing_count: i64,
+    pub neighbors: Vec<NodeNeighbor>,
+}
+
+/// Return everything the UI needs to let the user *explore* a node's
+/// connections: its own metadata, neighbor counts, and the top neighbors
+/// split into incoming / outgoing by edge direction.
+#[command]
+async fn get_node_detail(
+    workspace_path: String,
+    node_id: String,
+) -> Result<NodeDetail, String> {
+    let conn = db::open_workspace_db(Path::new(&workspace_path))
+        .map_err(|e| e.to_string())?;
+
+    let (name, node_type, subtype, props_json): (String, String, Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT name, type, subtype, props FROM node WHERE id = ?1",
+            rusqlite::params![node_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2).ok(), r.get(3)?)),
+        )
+        .map_err(|e| format!("Node not found: {}", e))?;
+
+    let (description, tier, confidence) = match props_json.as_deref() {
+        Some(s) if !s.is_empty() => {
+            let v: serde_json::Value = serde_json::from_str(s).unwrap_or_default();
+            (
+                v.get("description").and_then(|x| x.as_str()).map(String::from),
+                v.get("tier").and_then(|x| x.as_str()).map(String::from),
+                v.get("confidence").and_then(|x| x.as_f64()),
+            )
+        }
+        _ => (None, None, None),
+    };
+
+    let incoming_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM edge WHERE dst_id = ?1",
+            rusqlite::params![node_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let outgoing_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM edge WHERE src_id = ?1",
+            rusqlite::params![node_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
+    let mut neighbors: Vec<NodeNeighbor> = Vec::new();
+
+    // Incoming: things that point AT this node. For an entity, this is every
+    // conversation that mentions it (edge type = 'mentions', src = conversation).
+    let mut stmt_in = conn
+        .prepare(
+            "SELECT n.id, n.name, n.type, n.subtype, e.type
+             FROM edge e
+             JOIN node n ON n.id = e.src_id
+             WHERE e.dst_id = ?1
+             ORDER BY n.updated DESC
+             LIMIT 50",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows_in = stmt_in
+        .query_map(rusqlite::params![node_id], |r| {
+            Ok(NodeNeighbor {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                node_type: r.get(2)?,
+                subtype: r.get(3).ok(),
+                edge_type: r.get(4)?,
+                direction: "incoming",
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    for n in rows_in.flatten() {
+        neighbors.push(n);
+    }
+
+    // Outgoing: things this node points AT. For a conversation, these are
+    // the topics / concepts / entities it discusses.
+    let mut stmt_out = conn
+        .prepare(
+            "SELECT n.id, n.name, n.type, n.subtype, e.type
+             FROM edge e
+             JOIN node n ON n.id = e.dst_id
+             WHERE e.src_id = ?1
+             ORDER BY n.updated DESC
+             LIMIT 50",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows_out = stmt_out
+        .query_map(rusqlite::params![node_id], |r| {
+            Ok(NodeNeighbor {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                node_type: r.get(2)?,
+                subtype: r.get(3).ok(),
+                edge_type: r.get(4)?,
+                direction: "outgoing",
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    for n in rows_out.flatten() {
+        neighbors.push(n);
+    }
+
+    Ok(NodeDetail {
+        id: node_id,
+        name,
+        node_type,
+        subtype,
+        description,
+        tier,
+        confidence,
+        incoming_count,
+        outgoing_count,
+        neighbors,
+    })
+}
+
+/// Scope of a knowledge-graph rebuild. `refresh` only re-runs extraction for
+/// conversations that haven't been processed yet. `rebuild_all` wipes every
+/// derived node (topic/entity/concept/pattern) and re-queues every
+/// conversation — conversation nodes and the ingested message store are
+/// untouched, so you don't have to re-import the export.
+#[derive(serde::Serialize)]
+pub struct KgRebuildResult {
+    pub derived_nodes_deleted: i64,
+    pub edges_deleted: i64,
+    pub parked_deleted: i64,
+    pub conversations_requeued: i64,
+}
+
+/// Wipe every derived node (topic / concept / entity / source / pattern)
+/// along with its edges, embeddings, FTS rows, and parked proposals, then
+/// re-queue every conversation for fresh extraction. The ingested
+/// conversations.json store and `message_index` are untouched, so the user
+/// never needs to re-import. All work happens in a single transaction.
+#[command]
+async fn rebuild_knowledge_graph(
+    workspace_path: String,
+) -> Result<KgRebuildResult, String> {
+    let mut conn = db::open_workspace_db(Path::new(&workspace_path))
+        .map_err(|e| e.to_string())?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+
+    // 1. Wipe every edge that touches a derived node. Edges between two
+    //    conversations don't exist in the current schema, so this is
+    //    effectively all non-conversation-adjacent edges.
+    let edges_deleted = tx
+        .execute(
+            "DELETE FROM edge
+             WHERE src_id IN (SELECT id FROM node WHERE type != 'conversation')
+                OR dst_id IN (SELECT id FROM node WHERE type != 'conversation')",
+            [],
+        )
+        .map_err(|e| e.to_string())? as i64;
+
+    // 2. Drop the derived nodes' vector and FTS rows before the node delete —
+    //    those are virtual tables without FK cascade.
+    tx.execute(
+        "DELETE FROM node_vec WHERE node_id IN (SELECT id FROM node WHERE type != 'conversation')",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM node_fts WHERE node_id IN (SELECT id FROM node WHERE type != 'conversation')",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+
+    // 3. Delete the derived nodes.
+    let derived_nodes_deleted = tx
+        .execute("DELETE FROM node WHERE type != 'conversation'", [])
+        .map_err(|e| e.to_string())? as i64;
+
+    // 4. Clear parked items — they're per-conversation proposals that must
+    //    be regenerated by the fresh run.
+    let parked_deleted = tx
+        .execute("DELETE FROM parked_extractions", [])
+        .map_err(|e| e.to_string())? as i64;
+
+    // 5. Requeue every conversation. Rows without an extraction_state row
+    //    get inserted as pending so nothing is missed.
+    let updated = tx
+        .execute(
+            "UPDATE extraction_state
+             SET status='pending', error=NULL, started_at=NULL, completed_at=NULL",
+            [],
+        )
+        .map_err(|e| e.to_string())? as i64;
+    let inserted = tx
+        .execute(
+            "INSERT INTO extraction_state (conversation_id, status, content_hash, prompt_version, model_used, started_at)
+             SELECT n.id, 'pending', '', '1', NULL, NULL
+             FROM node n
+             LEFT JOIN extraction_state es ON es.conversation_id = n.id
+             WHERE n.type = 'conversation' AND es.conversation_id IS NULL",
+            [],
+        )
+        .map_err(|e| e.to_string())? as i64;
+
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(KgRebuildResult {
+        derived_nodes_deleted,
+        edges_deleted,
+        parked_deleted,
+        conversations_requeued: updated + inserted,
+    })
+}
+
 #[command]
 async fn retry_all_failed_extractions(workspace_path: String) -> Result<i64, String> {
     retry_all_failed_extractions_impl(Path::new(&workspace_path))
@@ -592,7 +828,8 @@ pub fn run() {
             init_workspace, ingest_conversations, reset_workspace, check_llm_health,
             list_available_models,
             extract_conversation, list_pending_extractions, list_failed_extractions,
-            skip_extraction, retry_extraction, retry_all_failed_extractions,
+            skip_extraction, retry_extraction, retry_all_failed_extractions, rebuild_knowledge_graph,
+            get_node_detail,
             record_extraction_failure, reset_stuck_processing, get_initial_graph,
             get_home_tiles, save_snapshot, load_snapshot, get_workspace_config,
             update_workspace_config,

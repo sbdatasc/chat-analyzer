@@ -146,13 +146,18 @@ export function GraphCanvas({
     const isTopic = node.group === 'topic';
     const isConv = node.group === 'conversation';
     const isEntity = node.group === 'entity';
+    const isSource = node.group === 'source';
+    const isConcept = node.group === 'concept';
 
-    // Base color mapping
-    let fill = '#f5f5f4'; // default stone-1
-    let stroke = '#d6d3d1'; // default stone-3
-    if (isTopic) fill = '#1A6B32'; // Accent green for topics
-    if (isConv) fill = '#e7e5e4'; // stone-2
-    if (isEntity) fill = '#1A6B32';
+    // Base color mapping — each taxonomy kind gets its own hue so the split
+    // between Entities (green) and Sources (red) is visible at a glance.
+    let fill = '#f5f5f4'; // default stone-1 (fallback for unclassified)
+    let stroke = '#d6d3d1';
+    if (isTopic) fill = '#1A6B32'; // topic: accent green
+    if (isConv) fill = '#e7e5e4'; // conversation: neutral stone
+    if (isEntity) fill = '#1A6B32'; // entity: green (named real-world things)
+    if (isSource) fill = '#B5432B'; // source: red (books/papers/talks)
+    if (isConcept) fill = '#D4941F'; // concept: amber (ideas)
 
     // Hover or Highlight Logic
     const isHighlighted = highlightNodes.has(node.id);
@@ -167,7 +172,7 @@ export function GraphCanvas({
       if (isHighlighted && !isTopic) stroke = '#1A6B32';
     }
 
-    const size = isTopic ? 6 : isConv ? 4 : isEntity ? 3 : 2.5;
+    const size = isTopic ? 6 : isConv ? 4 : isSource ? 3.5 : isEntity ? 3 : 2.5;
 
     ctx.beginPath();
     ctx.arc(node.x, node.y, size, 0, 2 * Math.PI, false);

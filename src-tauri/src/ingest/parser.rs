@@ -9,6 +9,14 @@ use std::path::Path;
 use sha2::{Sha256, Digest};
 use std::time::UNIX_EPOCH;
 
+#[derive(serde::Serialize)]
+struct StoredUserMessage {
+    message_id: String,
+    create_time: f64,
+    on_visible_path: bool,
+    text: String,
+}
+
 pub fn process_export_file(
     db: &mut Connection,
     file_path: &Path,
@@ -140,6 +148,7 @@ pub fn process_export_file(
         let mut branch_count: i64 = 0;
         let mut has_user_message = false;
         let mut models: HashSet<String> = HashSet::new();
+        let mut user_messages: Vec<StoredUserMessage> = Vec::new();
 
         for (node_id, node_val) in mapping {
             let children_len = node_val
@@ -179,7 +188,7 @@ pub fn process_export_file(
 
             let on_visible_path = if visible.contains(node_id) { 1 } else { 0 };
             let parent_id = node_val.get("parent").and_then(|v| v.as_str());
-            let cr_time = msg.get("create_time").and_then(|v| v.as_f64());
+            let cr_time = msg.get("create_time").and_then(|v| v.as_f64()).unwrap_or(0.0);
 
             let parts = msg
                 .get("content")
@@ -217,12 +226,29 @@ pub fn process_export_file(
                     0
                 ],
             )?;
+
+            user_messages.push(StoredUserMessage {
+                message_id: node_id.clone(),
+                create_time: cr_time,
+                on_visible_path: on_visible_path == 1,
+                text: text_content,
+            });
         }
 
         if !has_user_message {
             skipped += 1;
             continue;
         }
+
+        user_messages.sort_by(|a, b| {
+            a.create_time
+                .total_cmp(&b.create_time)
+                .then_with(|| a.message_id.cmp(&b.message_id))
+        });
+        let user_message_count = user_messages.len() as i64;
+        let char_count = user_messages.iter().map(|m| m.text.len() as i64).sum::<i64>();
+        let user_messages_json = serde_json::to_vec(&user_messages)?;
+        let compressed_user_messages = encode_all(user_messages_json.as_slice(), 3)?;
 
         let content_hash = {
             let mut h = Sha256::new();
@@ -253,6 +279,26 @@ pub fn process_export_file(
              VALUES (?1, ?2, ?3, ?4, 1)
              ON CONFLICT(conversation_id, source_id) DO UPDATE SET update_time=excluded.update_time, turn_count=excluded.turn_count",
             params![conv_id, source_id, update_time, turn_count]
+        )?;
+
+        tx.execute(
+            "INSERT INTO conversation_user_cache (
+                conversation_id, source_id, user_messages, user_message_count, char_count, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(conversation_id) DO UPDATE SET
+                source_id=excluded.source_id,
+                user_messages=excluded.user_messages,
+                user_message_count=excluded.user_message_count,
+                char_count=excluded.char_count,
+                updated_at=excluded.updated_at",
+            params![
+                conv_id,
+                source_id,
+                compressed_user_messages,
+                user_message_count,
+                char_count,
+                now,
+            ],
         )?;
 
         tx.execute(
@@ -322,6 +368,10 @@ fn purge_source(
 
     tx.execute(
         "DELETE FROM message_index WHERE source_id = ?1",
+        params![source_id],
+    )?;
+    tx.execute(
+        "DELETE FROM conversation_user_cache WHERE source_id = ?1",
         params![source_id],
     )?;
     tx.execute(

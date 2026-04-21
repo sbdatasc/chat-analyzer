@@ -22,6 +22,14 @@ const SOLID_THRESHOLD: f64 = 0.85;
 // local models we target.
 const SINGLE_PASS_THRESHOLD: usize = 45_000;
 
+#[derive(serde::Deserialize)]
+struct StoredUserMessage {
+    message_id: String,
+    create_time: f64,
+    on_visible_path: bool,
+    text: String,
+}
+
 // #region agent log
 const DEBUG_LOG_PATH: &str = "/Users/saurav/projects/apps/chat-analyzer/.cursor/debug-a5604b.log";
 fn agent_log(hypothesis_id: &str, location: &str, message: &str, data: Value) {
@@ -180,11 +188,119 @@ fn extract_balanced_json_value(text: &str) -> Option<&str> {
     None
 }
 
+/// Normalize common LLM output mistakes so serde_json can accept it:
+/// - Smart / curly quotes → straight quotes (models sometimes emit “ ” around keys/values).
+/// - Trailing commas before `]` or `}` (extremely common from LLMs).
+fn repair_common_json_mistakes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '“' | '”' | '„' | '‟' => out.push('"'),
+            '‘' | '’' | '‚' | '‛' => out.push('\''),
+            _ => out.push(ch),
+        }
+    }
+    // Strip trailing commas in arrays/objects: `,]` → `]`, `,}` → `}`, with
+    // whitespace tolerance. Not a JSON-tokenizer-correct implementation but
+    // sufficient for LLM-emitted payloads which don't use literal `,]` inside
+    // string values.
+    let mut result = String::with_capacity(out.len());
+    let bytes = out.as_bytes();
+    let mut i = 0;
+    let mut in_string = false;
+    let mut escape = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            result.push(b as char);
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_string = true;
+            result.push('"');
+            i += 1;
+            continue;
+        }
+        if b == b',' {
+            let mut j = i + 1;
+            while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\n' || bytes[j] == b'\r' || bytes[j] == b'\t') {
+                j += 1;
+            }
+            if j < bytes.len() && (bytes[j] == b']' || bytes[j] == b'}') {
+                // Skip the comma — the trailing one is what's breaking serde.
+                i += 1;
+                continue;
+            }
+        }
+        result.push(b as char);
+        i += 1;
+    }
+    result
+}
+
+/// Last-resort repair: if the LLM emitted a truncated or unterminated value
+/// (open `{[` with no matching close), append the minimum closing chars
+/// needed so serde_json can at least see a structurally complete value. This
+/// is safe-ish because the caller tolerates missing fields on individual
+/// items — the alternative is the whole conversation failing.
+fn close_unbalanced_json(s: &str) -> String {
+    let mut stack: Vec<char> = Vec::new();
+    let mut in_string = false;
+    let mut escape = false;
+    for ch in s.chars() {
+        if in_string {
+            if escape {
+                escape = false;
+                continue;
+            }
+            match ch {
+                '\\' => escape = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' => {
+                if stack.last().copied() == Some(ch) {
+                    stack.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = s.to_string();
+    // If we ended mid-string, close it first so trailing close chars don't
+    // fall inside the unterminated string.
+    if in_string {
+        out.push('"');
+    }
+    while let Some(closer) = stack.pop() {
+        out.push(closer);
+    }
+    out
+}
+
 fn parse_json_response(text: &str) -> Result<Value> {
-    if let Ok(v) = serde_json::from_str::<Value>(text.trim()) {
+    let trimmed = text.trim();
+
+    // Fast path: well-formed JSON straight from the model.
+    if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
         return Ok(v);
     }
 
+    // Markdown-fenced JSON (```json ... ```).
     for marker in ["```json", "```"] {
         if let Some(start) = text.find(marker) {
             let rest = &text[start + marker.len()..];
@@ -202,12 +318,87 @@ fn parse_json_response(text: &str) -> Result<Value> {
         }
     }
 
+    // Balanced-brace extraction on raw text.
     if let Some(val) = extract_balanced_json_value(text) {
-        return serde_json::from_str::<Value>(val)
-            .map_err(|e| anyhow!("invalid extracted JSON object: {}", e));
+        if let Ok(v) = serde_json::from_str::<Value>(val) {
+            return Ok(v);
+        }
+    }
+
+    // Common-mistake repair pass: smart quotes, trailing commas.
+    let repaired = repair_common_json_mistakes(trimmed);
+    if let Ok(v) = serde_json::from_str::<Value>(&repaired) {
+        return Ok(v);
+    }
+    if let Some(val) = extract_balanced_json_value(&repaired) {
+        if let Ok(v) = serde_json::from_str::<Value>(val) {
+            return Ok(v);
+        }
+    }
+
+    // Last resort: if the response is truncated (open braces/brackets with
+    // no matching closers), append the minimum closers to make it valid.
+    // Saves a conversation from a hard-fail when the model cut off cleanly.
+    let closed = close_unbalanced_json(&repaired);
+    if let Ok(v) = serde_json::from_str::<Value>(&closed) {
+        return Ok(v);
+    }
+    if let Some(val) = extract_balanced_json_value(&closed) {
+        if let Ok(v) = serde_json::from_str::<Value>(val) {
+            return Ok(v);
+        }
     }
 
     Err(anyhow!("no parseable JSON object in model response"))
+}
+
+fn load_conversation_user_messages(
+    db: &Connection,
+    conversation_id: &str,
+) -> Result<Vec<StoredUserMessage>> {
+    let cached_blob: Option<Vec<u8>> = db
+        .query_row(
+            "SELECT user_messages FROM conversation_user_cache WHERE conversation_id = ?1",
+            params![conversation_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+
+    if let Some(blob) = cached_blob {
+        let decompressed = zstd::stream::decode_all(&blob[..]).unwrap_or_default();
+        let mut messages: Vec<StoredUserMessage> = serde_json::from_slice(&decompressed)
+            .map_err(|e| anyhow!("invalid cached conversation transcript: {}", e))?;
+        messages.sort_by(|a, b| {
+            a.create_time
+                .total_cmp(&b.create_time)
+                .then_with(|| a.message_id.cmp(&b.message_id))
+        });
+        return Ok(messages);
+    }
+
+    let mut stmt = db.prepare(
+        "SELECT message_id, text_content, create_time, on_visible_path
+         FROM message_index
+         WHERE conversation_id = ?1 AND role = 'user'
+         ORDER BY create_time ASC",
+    )?;
+    let mut rows = stmt.query(params![conversation_id])?;
+    let mut messages = Vec::new();
+    while let Some(row) = rows.next()? {
+        let message_id: String = row.get(0)?;
+        let blob: Vec<u8> = row.get(1)?;
+        let create_time: f64 = row.get::<_, Option<f64>>(2)?.unwrap_or(0.0);
+        let on_visible_path: i64 = row.get(3)?;
+        let decompressed = zstd::stream::decode_all(&blob[..]).unwrap_or_default();
+        let text = String::from_utf8(decompressed).unwrap_or_default();
+        messages.push(StoredUserMessage {
+            message_id,
+            create_time,
+            on_visible_path: on_visible_path == 1,
+            text,
+        });
+    }
+    Ok(messages)
 }
 
 fn canonical_edge_type(kind: &str) -> &'static str {
@@ -215,12 +406,18 @@ fn canonical_edge_type(kind: &str) -> &'static str {
         "topic" => "belongs_to",
         "entity" => "mentions",
         "concept" => "discusses",
-        "pattern" => "uses_pattern",
+        "source" => "cites",
+        "pattern" => "uses_pattern", // legacy — migration converts these
         _ => "relates_to",
     }
 }
 
-fn parse_proposal(kind: &str, raw: Value, fallback_confidence: f64) -> Result<Proposed> {
+fn parse_proposal(
+    kind: &str,
+    subtype: Option<String>,
+    raw: Value,
+    fallback_confidence: f64,
+) -> Result<Proposed> {
     let name = raw
         .get("name")
         .and_then(|v| v.as_str())
@@ -249,6 +446,7 @@ fn parse_proposal(kind: &str, raw: Value, fallback_confidence: f64) -> Result<Pr
 
     Ok(Proposed {
         kind: kind.to_string(),
+        subtype,
         name,
         description,
         confidence: raw
@@ -268,7 +466,7 @@ fn clear_conversation_derivations(
         "SELECT DISTINCT dst_id
          FROM edge
          WHERE src_id = ?1
-           AND type IN ('belongs_to', 'mentions', 'discusses', 'uses_pattern')",
+           AND type IN ('belongs_to', 'mentions', 'discusses', 'cites', 'uses_pattern')",
     )?;
     let candidate_node_ids: Vec<String> = stmt
         .query_map(params![conversation_id], |r| r.get::<_, String>(0))?
@@ -282,7 +480,7 @@ fn clear_conversation_derivations(
     tx.execute(
         "DELETE FROM edge
          WHERE src_id = ?1
-           AND type IN ('belongs_to', 'mentions', 'discusses', 'uses_pattern')",
+           AND type IN ('belongs_to', 'mentions', 'discusses', 'cites', 'uses_pattern')",
         params![conversation_id],
     )?;
 
@@ -336,10 +534,21 @@ fn upsert_decision(
     }
 
     let node_id = if let Some(existing_id) = decision.merge_into {
-        tx.execute(
-            "UPDATE node SET updated = ?1 WHERE id = ?2",
-            params![now, &existing_id],
-        )?;
+        // If the incoming proposal has a subtype but the existing row
+        // doesn't (e.g. a pre-taxonomy extraction left it NULL), backfill it
+        // so the merged node gets the richer label. Never overwrite a
+        // subtype that's already set — preserves user-edited classifications.
+        if let Some(ref st) = p.subtype {
+            tx.execute(
+                "UPDATE node SET updated = ?1, subtype = COALESCE(subtype, ?2) WHERE id = ?3",
+                params![now, st, &existing_id],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE node SET updated = ?1 WHERE id = ?2",
+                params![now, &existing_id],
+            )?;
+        }
         existing_id
     } else {
         let new_id = uuid::Uuid::new_v4().to_string();
@@ -356,9 +565,16 @@ fn upsert_decision(
             "approved": approved_by_user,
         });
         tx.execute(
-            "INSERT INTO node (id, type, name, props, created, updated)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-            params![&new_id, p.kind, p.name, props.to_string(), now],
+            "INSERT INTO node (id, type, subtype, name, props, created, updated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+            params![
+                &new_id,
+                p.kind,
+                p.subtype.clone(),
+                p.name,
+                props.to_string(),
+                now
+            ],
         )?;
         if let Some(ref emb) = decision.embedding {
             let bytes = vec_bytes(emb);
@@ -504,6 +720,10 @@ pub async fn extract_single_conversation(
 
 struct Proposed {
     kind: String,
+    /// Wiki-taxonomy subtype: person/tool/framework/etc for entities,
+    /// book/paper/talk/etc for sources, "pattern" for concept patterns.
+    /// None for topics and untyped concepts.
+    subtype: Option<String>,
     name: String,
     description: Option<String>,
     confidence: f64,
@@ -528,10 +748,25 @@ pub async fn approve_parked_payload(
     embed_model: &str,
 ) -> Result<()> {
     let raw: Value = serde_json::from_str(payload)?;
-    let proposal = parse_proposal(kind, raw, confidence)?;
+    // Parked proposals were parked by the worker with the raw JSON the LLM
+    // emitted, so `subtype` / legacy `type` might be in there — pick whichever
+    // is present and let the rest of the pipeline store it verbatim. (The
+    // whitelist check happened when it was sanitized during the original
+    // extraction pass; we don't re-validate here to avoid silent drops on
+    // approval.)
+    let subtype = raw
+        .get("subtype")
+        .and_then(|v| v.as_str())
+        .or_else(|| raw.get("type").and_then(|v| v.as_str()))
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty());
+    let proposal = parse_proposal(kind, subtype, raw, confidence)?;
     let db_path = workspace_path.join("state").join("app.sqlite");
 
-    let embedding = if proposal.kind != "pattern" {
+    // Concept-patterns (subtype='pattern') skip embedding like the legacy
+    // top-level 'pattern' type did.
+    let is_pattern = proposal.kind == "concept" && proposal.subtype.as_deref() == Some("pattern");
+    let embedding = if !is_pattern {
         let input = match &proposal.description {
             Some(d) if !d.is_empty() => format!("{}: {}", proposal.name, d),
             _ => proposal.name.clone(),
@@ -606,35 +841,24 @@ async fn do_extract(
             params![conversation_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
-        let mut stmt = db.prepare(
-            "SELECT message_id, text_content, role FROM message_index
-             WHERE conversation_id = ?1 AND role = 'user' AND on_visible_path = 1
-             ORDER BY create_time ASC",
-        )?;
-        let mut rows = stmt.query(params![conversation_id])?;
-        
+        let messages = load_conversation_user_messages(&db, conversation_id)?;
+
         let mut chunks = Vec::new();
         let mut current_chunk = String::new();
-        
-        while let Some(row) = rows.next()? {
-            let msg_id: String = row.get(0)?;
-            let blob: Vec<u8> = row.get(1)?;
-            let role: String = row.get(2)?;
-            let decompressed = zstd::stream::decode_all(&blob[..]).unwrap_or_default();
-            if let Ok(text) = String::from_utf8(decompressed) {
-                let snippet = if text.len() > MAX_MSG_SNIPPET {
-                    format!("{}…", &text[..MAX_MSG_SNIPPET])
-                } else {
-                    text
-                };
-                let chunk_str = format!("[{}] {}:\n{}\n\n", msg_id, role, snippet);
-                
-                if current_chunk.len() + chunk_str.len() > CHUNK_SIZE_CHARS && !current_chunk.is_empty() {
-                    chunks.push(current_chunk.clone());
-                    current_chunk.clear();
-                }
-                current_chunk.push_str(&chunk_str);
+
+        for msg in messages.into_iter().filter(|m| m.on_visible_path) {
+            let snippet = if msg.text.len() > MAX_MSG_SNIPPET {
+                format!("{}…", &msg.text[..MAX_MSG_SNIPPET])
+            } else {
+                msg.text
+            };
+            let chunk_str = format!("[{}] user:\n{}\n\n", msg.message_id, snippet);
+
+            if current_chunk.len() + chunk_str.len() > CHUNK_SIZE_CHARS && !current_chunk.is_empty() {
+                chunks.push(current_chunk.clone());
+                current_chunk.clear();
             }
+            current_chunk.push_str(&chunk_str);
         }
         if !current_chunk.is_empty() {
             chunks.push(current_chunk);
@@ -743,12 +967,18 @@ async fn do_extract(
         .ok()
     };
 
+    let mut safe_summary = master_summary;
+    if safe_summary.len() > 15000 {
+        safe_summary.truncate(15000);
+        safe_summary.push_str("\n... [Snippet Truncated to 15000 Chars Limit]");
+    }
+
     let prompt = match prompt_body {
         Some(body) => body
             .replace("{{title}}", &title)
             .replace("{{created}}", &created)
-            .replace("{{messages_with_ids}}", &master_summary),
-        None => default_extraction_prompt(&title, &created, &master_summary),
+            .replace("{{messages_with_ids}}", &safe_summary),
+        None => default_extraction_prompt(&title, &created, &safe_summary),
     };
 
     let t_reduce = Instant::now();
@@ -776,7 +1006,7 @@ async fn do_extract(
                 "extract_model": extract_model,
                 "prompt_len": p.len(),
                 "json_mode": true,
-                "max_tokens": 900,
+                "max_tokens": 6000,
             }),
         );
         let response = llm
@@ -789,7 +1019,7 @@ async fn do_extract(
                 ChatOpts {
                     temperature: 0.2,
                     json_mode: true,
-                    max_tokens: Some(900),
+                    max_tokens: Some(6000),
                 },
             )
             .await?;
@@ -864,35 +1094,47 @@ async fn do_extract(
 
     let sanitized = sanitize_extraction_output(json_output.clone())?;
     eprintln!(
-        "[extract {}] chat returned, parsing {} topic / {} entity / {} concept / {} pattern",
+        "[extract {}] chat returned, parsing {} topic / {} entity / {} concept / {} source",
         conversation_id,
         sanitized.topics.len(),
         sanitized.entities.len(),
         sanitized.concepts.len(),
-        sanitized.prompt_patterns.len()
+        sanitized.sources.len()
     );
 
     let mut proposals: Vec<Proposed> = Vec::new();
     // Convert sanitized output back into the internal proposal representation.
+    // Topics never carry a subtype. Entities / sources / concepts pass theirs
+    // through so downstream persistence writes the `subtype` column.
     for item in sanitized.topics {
-        proposals.push(parse_proposal("topic", item.raw, item.confidence)?);
+        proposals.push(parse_proposal("topic", None, item.raw, item.confidence)?);
     }
     for item in sanitized.entities {
-        proposals.push(parse_proposal("entity", item.raw, item.confidence)?);
+        let subtype = item.subtype.clone();
+        proposals.push(parse_proposal("entity", subtype, item.raw, item.confidence)?);
     }
     for item in sanitized.concepts {
-        proposals.push(parse_proposal("concept", item.raw, item.confidence)?);
+        let subtype = item.subtype.clone();
+        proposals.push(parse_proposal("concept", subtype, item.raw, item.confidence)?);
     }
-    for item in sanitized.prompt_patterns {
-        proposals.push(parse_proposal("pattern", item.raw, item.confidence)?);
+    for item in sanitized.sources {
+        let subtype = item.subtype.clone();
+        proposals.push(parse_proposal("source", subtype, item.raw, item.confidence)?);
     }
 
     // Batch embed everything that needs it in one HTTP call, then run the
-    // dedup queries. Patterns use exact-name match, so they skip embeds.
+    // dedup queries. Concept-patterns (subtype='pattern') use exact-name
+    // match like the old top-level pattern type did — no embedding needed.
     let embed_indexes: Vec<usize> = proposals
         .iter()
         .enumerate()
-        .filter(|(_, p)| p.confidence >= PARKED_THRESHOLD && p.kind != "pattern")
+        .filter(|(_, p)| {
+            if p.confidence < PARKED_THRESHOLD {
+                return false;
+            }
+            let is_pattern = p.kind == "concept" && p.subtype.as_deref() == Some("pattern");
+            !is_pattern
+        })
         .map(|(i, _)| i)
         .collect();
     let embed_inputs: Vec<String> = embed_indexes
@@ -925,11 +1167,14 @@ async fn do_extract(
             });
             continue;
         }
-        if p.kind == "pattern" {
+        // Concept-patterns dedup on exact name (they're repeatable solution
+        // shapes — if the user sees "idempotent retry" twice in different
+        // conversations, it's the same pattern). No embedding round-trip.
+        if p.kind == "concept" && p.subtype.as_deref() == Some("pattern") {
             let db = Connection::open(db_path)?;
             let existing: Option<String> = db
                 .query_row(
-                    "SELECT id FROM node WHERE type='pattern' AND name=?1 LIMIT 1",
+                    "SELECT id FROM node WHERE type='concept' AND subtype='pattern' AND name=?1 LIMIT 1",
                     params![p.name],
                     |r| r.get(0),
                 )
@@ -988,17 +1233,20 @@ async fn do_extract(
 }
 
 fn default_extraction_prompt(title: &str, created: &str, messages: &str) -> String {
-    // Tight prompt: less prefill time for the model, same shape of output.
-    // Field definitions kept terse because downstream code handles all the
-    // thresholding and dedup — the model only needs to emit items + scores.
+    // Wiki taxonomy prompt: entities vs sources are separated so books/papers
+    // don't pollute the Entities collection. Concepts absorb "patterns" via
+    // the optional subtype field (rule #8: patterns are a concept subtype).
+    // Topics never carry a subtype. Subtype whitelist lives in kg/extraction.rs
+    // (validate_subtype) — the model emitting a value outside the whitelist
+    // is silently dropped to null there, so we can keep the prompt terse.
     format!(
-        r#"Extract a knowledge graph from this conversation as JSON.
+        r#"Extract a knowledge graph from this conversation as JSON, following a wiki taxonomy.
 
-Fields:
-- topics: 1-3 high-level subjects. lowercase-kebab names.
-- entities: named things (person|tool|org|book|tech|place).
-- concepts: atomic ideas worth remembering. max 15.
-- prompt_patterns: reusable question framings. max 3.
+Collections:
+- topics: 1-3 broad subject domains (e.g. digital-transformation, retail-banking). lowercase-kebab names. No subtype.
+- concepts: reusable idea units (e.g. idempotency, rate-limiting). max 15. Optional subtype: "pattern" for repeatable solution shapes.
+- entities: named real-world things. Required subtype — one of: person, organization, tool, product, standard, framework, technology, place. Do NOT put books/articles/papers/courses/talks here — they go in sources.
+- sources: inputs the user learns from. Required subtype — one of: book, article, paper, course, talk.
 
 Only include items DISCUSSED substantively. Confidence 0.9+=defined, 0.6-0.85=mentioned, <0.6=uncertain. Cite 1-3 message_ids each.
 
@@ -1007,8 +1255,8 @@ Date: {}
 Messages:
 {}
 
-JSON only, no prose:
-{{"topics":[{{"name":"","confidence":0.0,"message_ids":[]}}],"entities":[{{"name":"","type":"","description":"","confidence":0.0,"message_ids":[]}}],"concepts":[{{"name":"","description":"","confidence":0.0,"message_ids":[]}}],"prompt_patterns":[{{"name":"","description":"","confidence":0.0,"message_ids":[]}}]}}"#,
+JSON only, no prose. Schema:
+{{"topics":[{{"name":"","description":"","confidence":0.0,"message_ids":[]}}],"concepts":[{{"name":"","description":"","subtype":null,"confidence":0.0,"message_ids":[]}}],"entities":[{{"name":"","description":"","subtype":"","confidence":0.0,"message_ids":[]}}],"sources":[{{"name":"","description":"","subtype":"","confidence":0.0,"message_ids":[]}}]}}"#,
         title, created, messages
     )
 }
@@ -1020,7 +1268,7 @@ mod tests {
     #[test]
     fn parse_json_response_accepts_fenced_json() {
         let parsed = parse_json_response(
-            "Here you go:\n```json\n{\"topics\":[],\"entities\":[],\"concepts\":[],\"prompt_patterns\":[]}\n```",
+            "Here you go:\n```json\n{\"topics\":[],\"entities\":[],\"concepts\":[],\"sources\":[]}\n```",
         )
         .expect("fenced json should parse");
         assert!(parsed.get("topics").is_some());
@@ -1029,7 +1277,7 @@ mod tests {
     #[test]
     fn parse_json_response_extracts_balanced_object_from_prose() {
         let parsed = parse_json_response(
-            "Answer first, then JSON: {\"topics\":[],\"entities\":[],\"concepts\":[{\"name\":\"x\"}],\"prompt_patterns\":[]} trailing note",
+            "Answer first, then JSON: {\"topics\":[],\"entities\":[],\"concepts\":[{\"name\":\"x\"}],\"sources\":[]} trailing note",
         )
         .expect("embedded object should parse");
         assert_eq!(parsed["concepts"][0]["name"], "x");

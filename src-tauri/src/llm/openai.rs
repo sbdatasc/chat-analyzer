@@ -5,6 +5,7 @@ use anyhow::{Result, anyhow};
 use std::time::Duration;
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::error::Error as _;
 
 pub struct OpenAiCompatibleClient {
     pub base_url: String,
@@ -23,12 +24,26 @@ impl OpenAiCompatibleClient {
         let is_ollama = base_url.contains("localhost")
             || base_url.contains("127.0.0.1")
             || base_url.contains(":11434");
+        // Cloud extraction requests can take materially longer than local
+        // Ollama to produce the first byte of a large JSON response. Give
+        // them a wider timeout so healthy requests don't burn all retries and
+        // incorrectly push the sync onto backup.
+        let request_timeout = if is_ollama {
+            Duration::from_secs(30)
+        } else {
+            Duration::from_secs(60)
+        };
+        let connect_timeout = if is_ollama {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_secs(10)
+        };
         Self {
             base_url,
             api_key,
             client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .connect_timeout(Duration::from_secs(5))
+                .timeout(request_timeout)
+                .connect_timeout(connect_timeout)
                 .build()
                 .unwrap_or_default(),
             is_ollama,
@@ -186,9 +201,9 @@ fn model_is_thinking(name: &str) -> bool {
     if n.contains("thinking") || n.contains("reasoning") {
         return true;
     }
-    // Gemini 2.5 Pro is a thinking model by default; flash variants aren't
-    // unless the name contains `-thinking`.
-    if n.starts_with("gemini-2.5-pro") || n == "gemini-2.5-pro" {
+    // Gemini 2.5 series (both Pro and Flash variants) heavily utilizes
+    // internal structural tokens for chain-of-thought routing.
+    if n.starts_with("gemini-2.5") {
         return true;
     }
     // OpenAI o-series reasoning models.
@@ -221,6 +236,27 @@ where
     Err(last_err.unwrap_or_else(|| anyhow!("retry exhausted")))
 }
 
+fn format_reqwest_error(url: &str, err: &reqwest::Error) -> anyhow::Error {
+    let mut detail = err.to_string();
+    let mut current = err.source();
+    while let Some(source) = current {
+        let source_text = source.to_string();
+        if !source_text.is_empty() && !detail.contains(&source_text) {
+            detail.push_str(": ");
+            detail.push_str(&source_text);
+        }
+        current = source.source();
+    }
+
+    if err.is_timeout() {
+        anyhow!("network timeout reaching {}: {}", url, detail)
+    } else if err.is_connect() {
+        anyhow!("connection error reaching {}: {}", url, detail)
+    } else {
+        anyhow!("network error reaching {}: {}", url, detail)
+    }
+}
+
 async fn post_json(
     client: &reqwest::Client,
     url: &str,
@@ -232,7 +268,8 @@ async fn post_json(
         .header("Authorization", format!("Bearer {}", api_key))
         .json(body)
         .send()
-        .await?;
+        .await
+        .map_err(|e| format_reqwest_error(url, &e))?;
     let status = resp.status();
     let text = resp.text().await?;
     if !status.is_success() {
@@ -402,7 +439,7 @@ impl LlmClient for OpenAiCompatibleClient {
             .header("Authorization", format!("Bearer {}", self.api_key))
             .send()
             .await
-            .map_err(|e| anyhow!("network error reaching {}: {}", url, e))?;
+            .map_err(|e| format_reqwest_error(&url, &e))?;
 
         let status = http.status();
         let text = http.text().await.unwrap_or_default();
