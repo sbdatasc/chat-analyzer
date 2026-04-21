@@ -63,24 +63,38 @@ async fn extract_conversation(
     embed_model: Option<String>,
     triage_model: Option<String>,
     // Separate client for embeddings. The workspace vec table is dimensioned
-    // for nomic-embed-text (768 dims), so embeddings must stay on whichever
-    // endpoint serves that model — typically local Ollama, even when
-    // extraction itself is routed to cloud. Defaults to local Ollama when
-    // callers don't supply these.
+    // for 768-dim nomic-embed-text, so embeddings must stay on the endpoint
+    // that serves that model — typically local Ollama, even when extraction
+    // itself is routed to cloud. Callers MUST supply both fields; we no
+    // longer substitute a hardcoded URL / model name if they're missing.
     embed_base_url: Option<String>,
     embed_api_key: Option<String>,
 ) -> Result<String, String> {
     use llm::LlmClient;
+
+    // Surface clear errors instead of silently substituting hardcoded fallbacks.
+    if model.trim().is_empty() {
+        return Err("No extraction model selected. Configure it in Settings → LLM Routing.".to_string());
+    }
+    let embed_model = embed_model
+        .and_then(|m| if m.trim().is_empty() { None } else { Some(m) })
+        .ok_or_else(|| "No embedding model selected. Configure it in Settings → LLM Routing (Embedding).".to_string())?;
+    let embed_base_url = embed_base_url
+        .and_then(|u| if u.trim().is_empty() { None } else { Some(u) })
+        .ok_or_else(|| "No embedding endpoint configured. Configure Local LLM in Settings.".to_string())?;
+    // Triage shares the extraction client; if the caller doesn't pick one
+    // explicitly, reuse the extraction model — that's the only model guaranteed
+    // to work on this client, and it's derived from the user's selection, not
+    // a hardcoded value.
+    let triage = triage_model
+        .and_then(|m| if m.trim().is_empty() { None } else { Some(m) })
+        .unwrap_or_else(|| model.clone());
+
     let chat_client = llm::openai::OpenAiCompatibleClient::new(base_url, api_key);
     let embed_client = llm::openai::OpenAiCompatibleClient::new(
-        embed_base_url.unwrap_or_else(|| "http://localhost:11434/v1".to_string()),
+        embed_base_url,
         embed_api_key.unwrap_or_default(),
     );
-    let embed = embed_model.unwrap_or_else(|| "nomic-embed-text".to_string());
-    // Falls back to the heavy extract model if the caller doesn't supply a
-    // cheaper one. Sub-15k-char conversations bypass the map stage anyway so
-    // this fallback only matters for the parallel summarize calls.
-    let triage = triage_model.unwrap_or_else(|| model.clone());
 
     ingest::extraction::extract_single_conversation(
         Path::new(&workspace_path),
@@ -88,7 +102,7 @@ async fn extract_conversation(
         &embed_client as &dyn LlmClient,
         &model,
         &triage,
-        &embed,
+        &embed_model,
         &conversation_id,
     )
     .await

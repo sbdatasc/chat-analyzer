@@ -3,7 +3,6 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   CLOUD_PROVIDERS,
-  defaultModelForJob,
   inferCloudProvider,
   type CloudProvider,
   type WorkspaceConfig,
@@ -33,16 +32,31 @@ export function SetupView({
   const [localModels, setLocalModels] = useState<string[]>([]);
   const [cloudModels, setCloudModels] = useState<string[]>([]);
 
+  // Fetch the Local endpoint's available models using whatever base_url the
+  // user has configured — never hardcoded. If Local isn't configured or is
+  // unreachable, the list stays empty and the JobSelect dropdown reflects that.
   useEffect(() => {
+    const local = config?.endpoints.default;
+    if (!local?.base_url) {
+      setLocalModels([]);
+      return;
+    }
+    let cancelled = false;
     invoke<string[]>("list_available_models", {
-      baseUrl: "http://localhost:11434/v1",
-      apiKey: "",
+      baseUrl: local.base_url,
+      apiKey: local.api_key || "",
     })
-      .then((m) =>
-        setLocalModels(m.filter((name) => !name.toLowerCase().includes("embed")))
-      )
-      .catch(() => setLocalModels([]));
-  }, []);
+      .then((m) => {
+        if (cancelled) return;
+        setLocalModels(m.filter((name) => !name.toLowerCase().includes("embed")));
+      })
+      .catch(() => {
+        if (!cancelled) setLocalModels([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [config?.endpoints.default.base_url, config?.endpoints.default.api_key]);
 
   useEffect(() => {
     if (!config?.endpoints.cloud.base_url || !config?.endpoints.cloud.api_key) return;
@@ -247,19 +261,37 @@ export function SetupView({
     }
   }
 
+  // The Local health probe uses whatever base_url the user has configured.
+  // If Local isn't set up at all, the UI surfaces that directly — no silent
+  // fallback to a hardcoded localhost.
   async function handleCheckLlm() {
+    const local = config?.endpoints.default;
+    if (!local?.base_url) {
+      setHealthStatus({
+        models: false,
+        chat: false,
+        embeddings: false,
+        json_mode: false,
+        models_error: "Local endpoint isn't configured. Add a base URL in Settings → Local LLM.",
+      });
+      return;
+    }
     setCheckingLlm(true);
     setHealthStatus(null);
     try {
       const s = await invoke("check_llm_health", {
-        baseUrl: "http://localhost:11434/v1",
-        apiKey: "ollama",
+        baseUrl: local.base_url,
+        apiKey: local.api_key || "",
       });
       setHealthStatus(s);
     } catch (e: any) {
-      // Use inline surfacing (like cloud) instead of an alert — alert() blocks
-      // the page and is the wrong tone for a passive health check.
-      setHealthStatus({ models: false, chat: false, embeddings: false, json_mode: false, models_error: String(e) });
+      setHealthStatus({
+        models: false,
+        chat: false,
+        embeddings: false,
+        json_mode: false,
+        models_error: String(e),
+      });
     }
     setCheckingLlm(false);
   }
@@ -269,13 +301,15 @@ export function SetupView({
   // of what's reachable without an extra click.
   const autoCheckedRef = useRef(false);
   const cloudReady = Boolean(config?.endpoints.cloud.base_url && config?.endpoints.cloud.api_key);
+  const localReady = Boolean(config?.endpoints.default?.base_url);
   useEffect(() => {
     if (autoCheckedRef.current) return;
+    if (!config) return; // wait for config to load before the first probe
     autoCheckedRef.current = true;
-    handleCheckLlm();
+    if (localReady) handleCheckLlm();
     if (cloudReady) handleCheckCloud();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [config, localReady, cloudReady]);
   // If the cloud credentials arrive after mount (e.g. user just pasted a
   // key), auto-run the cloud probe so the status updates without a click.
   useEffect(() => {
@@ -326,6 +360,11 @@ export function SetupView({
     const preset = CLOUD_PROVIDERS[provider];
     // Provider switch clears the API key — keys don't transfer between
     // providers, and leaving the old key in place would just fail on next call.
+    // Jobs that pointed at cloud keep their endpoint assignment but have their
+    // model cleared: we don't know what models the new provider actually serves
+    // until the /models list comes back, and silently seeding a guessed default
+    // is exactly the hardcoding this app now avoids. The JobSelect dropdown
+    // will show "(not selected)" until the user picks from the live list.
     const cloud = {
       ...config.endpoints.cloud,
       provider,
@@ -333,22 +372,22 @@ export function SetupView({
       base_url: provider === 'custom' ? (config.endpoints.cloud.base_url || '') : preset.base_url,
       api_key: provider === currentProvider ? config.endpoints.cloud.api_key : '',
     };
-    // Seed sensible default models for any job already routed to cloud, but
-    // only if the current model is empty (don't clobber a user's explicit pick).
-    const seed = (job: keyof WorkspaceConfig['jobs'], which: 'chat' | 'extraction' | 'triage') => {
-      const j = config.jobs[job];
-      if (j.endpoint !== 'cloud') return j;
-      if (j.model && j.model.trim() !== '') return j;
-      return { ...j, model: preset.default_models[which] };
-    };
+    const clearIfCloud = (j: WorkspaceConfig['jobs'][keyof WorkspaceConfig['jobs']]) =>
+      j.endpoint === 'cloud' ? { ...j, model: '' } : j;
+    const clearIfBackupCloud = (j: WorkspaceConfig['jobs'][keyof WorkspaceConfig['jobs']]) =>
+      j.backup_endpoint === 'cloud' ? { ...j, backup_model: '' } : j;
+    const resetJobs = (k: keyof WorkspaceConfig['jobs']) => clearIfBackupCloud(clearIfCloud(config.jobs[k]));
+
     onUpdateConfig({
       ...config,
       endpoints: { ...config.endpoints, cloud },
       jobs: {
         ...config.jobs,
-        chat: seed('chat', 'chat'),
-        extraction: seed('extraction', 'extraction'),
-        triage_preview: seed('triage_preview', 'triage'),
+        chat: resetJobs('chat'),
+        extraction: resetJobs('extraction'),
+        triage_preview: resetJobs('triage_preview'),
+        embedding: resetJobs('embedding'),
+        evaluation: resetJobs('evaluation'),
       },
     });
     // Reset the cached health result since the target just changed.
@@ -418,13 +457,28 @@ export function SetupView({
 
             {/* Local LLM */}
             <section className="border border-stone-1 rounded-lg p-5 bg-surface-elev flex flex-col gap-3">
-              <h2 className="text-sm font-medium text-text">Local LLM Endpoint</h2>
-              <p className="text-xs text-text-muted leading-relaxed font-mono">
-                http://localhost:11434/v1
+              <div className="flex items-center justify-between gap-2">
+                <h2 className="text-sm font-medium text-text">Local LLM Endpoint</h2>
+                {/* Status pill at the section header makes the truth state
+                    unmissable: green=reachable, red=not reachable, grey=unchecked. */}
+                {healthStatus ? (
+                  healthStatus.models ? (
+                    <span className="text-[10px] font-medium text-flag-green bg-flag-green/10 border border-flag-green/40 rounded px-2 py-0.5 uppercase tracking-wider">Reachable</span>
+                  ) : (
+                    <span className="text-[10px] font-medium text-flag-red bg-flag-red/10 border border-flag-red/40 rounded px-2 py-0.5 uppercase tracking-wider">Not reachable</span>
+                  )
+                ) : checkingLlm ? (
+                  <span className="text-[10px] font-medium text-text-muted border border-stone-2 rounded px-2 py-0.5 uppercase tracking-wider">Checking…</span>
+                ) : (
+                  <span className="text-[10px] font-medium text-text-muted border border-stone-2 rounded px-2 py-0.5 uppercase tracking-wider">Unchecked</span>
+                )}
+              </div>
+              <p className="text-xs text-text-muted leading-relaxed font-mono break-all">
+                {config?.endpoints.default?.base_url || <span className="italic text-flag-amber">Not configured</span>}
               </p>
               <button
                 onClick={handleCheckLlm}
-                disabled={checkingLlm}
+                disabled={checkingLlm || !config?.endpoints.default?.base_url}
                 className="bg-stone-1 hover:bg-stone-2 disabled:opacity-50 text-text text-sm px-4 py-2 rounded font-medium transition-colors border border-stone-2"
               >
                 {checkingLlm ? "Checking…" : "Check health"}
@@ -432,22 +486,30 @@ export function SetupView({
 
               {healthStatus && (
                 <div className="flex flex-col gap-2 mt-2">
+                  {/* The headline "Not reachable" banner when the endpoint
+                      doesn't even respond — this is the case that was
+                      misleading before (Ollama down, but UI looked cheerful). */}
+                  {!healthStatus.models && (
+                    <div className="border border-flag-red/50 bg-flag-red/5 rounded p-2 text-[11px] text-flag-red leading-relaxed">
+                      <strong>Local LLM not reachable.</strong> Chat, extraction, and embeddings that route through Local will fail until this is fixed. Common causes: Ollama isn't running, or the base URL is wrong.
+                    </div>
+                  )}
                   <ul className="text-xs space-y-1">
                     <HealthRow label="Endpoint" ok={healthStatus.models} okText="Online" badText="Offline" />
-                    <HealthRow label="Chat" ok={healthStatus.chat} okText={healthStatus.json_mode ? "OK (JSON mode)" : "OK (no JSON mode)"} badText="Failed" />
-                    <HealthRow label="Embeddings" ok={healthStatus.embeddings} okText="OK" badText="Failed" />
+                    <HealthRow label="Chat" ok={healthStatus.chat} okText={healthStatus.json_mode ? "OK (JSON mode)" : "OK (no JSON mode)"} badText={healthStatus.models ? "Failed" : "— (endpoint down)"} />
+                    <HealthRow label="Embeddings" ok={healthStatus.embeddings} okText="OK" badText={healthStatus.models ? "Failed" : "— (endpoint down)"} />
                   </ul>
                   {(healthStatus.models_error || healthStatus.chat_error || healthStatus.embeddings_error) && (
                     <div className="border border-flag-red/40 rounded p-2 bg-surface flex flex-col gap-1.5">
                       <div className="text-[10px] font-medium text-flag-red uppercase tracking-wider">What went wrong</div>
                       {healthStatus.models_error && (
-                        <ErrorLine label="Endpoint" detail={healthStatus.models_error} hint="Is Ollama running? Try `ollama serve` in a terminal." />
+                        <ErrorLine label="Endpoint" detail={healthStatus.models_error} hint="Is your local LLM server running at the base URL above? For Ollama, try `ollama serve` in a terminal." />
                       )}
                       {healthStatus.chat_error && (
-                        <ErrorLine label="Chat" detail={healthStatus.chat_error} hint="Pull a chat model with `ollama pull qwen2.5:7b`." />
+                        <ErrorLine label="Chat" detail={healthStatus.chat_error} hint="The endpoint is up but the chat model you selected in Settings → LLM Routing isn't available. Pick a different model, or pull it on the server." />
                       )}
                       {healthStatus.embeddings_error && (
-                        <ErrorLine label="Embeddings" detail={healthStatus.embeddings_error} hint="Pull the embedding model with `ollama pull nomic-embed-text`." />
+                        <ErrorLine label="Embeddings" detail={healthStatus.embeddings_error} hint="The endpoint is up but the embedding model you selected in Settings → LLM Routing (Embedding) isn't available on the server." />
                       )}
                     </div>
                   )}
@@ -750,11 +812,14 @@ function JobSelect({
   const models = effectiveEp === 'cloud' ? cloudModels : localModels;
   const backupEp = (j.backup_endpoint && j.backup_endpoint !== '') ? j.backup_endpoint : 'none';
   const backupModels = backupEp === 'cloud' ? cloudModels : backupEp === 'default' ? localModels : [];
+  // When the user toggles endpoint (Local ↔ Cloud), prefill the model with the
+  // first actually-available model from that endpoint's live /models list.
+  // If the list is empty (endpoint down / cloud not configured), leave the
+  // model blank — the UI surfaces "(no model selected)" and the user picks.
+  // No hardcoded model names are used here, ever.
   const pickModelForEndpoint = (endpoint: string) => {
-    if (endpoint === 'cloud' && inferCloudProvider(config.endpoints.cloud) === 'custom') {
-      return cloudModels[0] || defaultModelForJob(job, endpoint, config);
-    }
-    return defaultModelForJob(job, endpoint, config);
+    const list = endpoint === 'cloud' ? cloudModels : localModels;
+    return list[0] || '';
   };
 
   return (
@@ -773,12 +838,15 @@ function JobSelect({
           </option>
         </select>
         <select
-          value={j.model}
+          value={j.model || ''}
           onChange={(e) => onUpdate(job, currentEp, e.target.value)}
           className="bg-surface border border-stone-2 rounded px-2 py-1 text-xs text-text focus:border-accent outline-none flex-1"
         >
-          {models.length === 0 && j.model && (
-            <option value={j.model}>{j.model}</option>
+          <option value="">— Select a model —</option>
+          {/* If the user's saved model isn't in the live list, still show it
+              so they don't lose their selection, but mark it as stale. */}
+          {j.model && !models.includes(j.model) && (
+            <option value={j.model}>{j.model} (not served by endpoint)</option>
           )}
           {models.map(m => <option key={m} value={m}>{m}</option>)}
         </select>
@@ -811,8 +879,9 @@ function JobSelect({
           className="bg-surface border border-stone-2 rounded px-2 py-1 text-xs text-text focus:border-accent outline-none flex-1 disabled:opacity-50"
         >
           {backupEp === 'none' && <option value="">—</option>}
-          {backupModels.length === 0 && j.backup_model && (
-            <option value={j.backup_model}>{j.backup_model}</option>
+          {backupEp !== 'none' && <option value="">— Select a model —</option>}
+          {j.backup_model && !backupModels.includes(j.backup_model) && backupEp !== 'none' && (
+            <option value={j.backup_model}>{j.backup_model} (not served by endpoint)</option>
           )}
           {backupModels.map(m => <option key={m} value={m}>{m}</option>)}
         </select>

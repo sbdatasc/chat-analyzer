@@ -507,19 +507,28 @@ impl LlmClient for OpenAiCompatibleClient {
             }
         }
 
-        // §14 probe 3: embeddings.
+        // §14 probe 3: embeddings. Pick the first model in the endpoint's
+        // own /models list that looks like an embedding model. If the endpoint
+        // doesn't advertise one, skip the probe rather than hardcoding a
+        // model name — an honest "not reachable" beats a false signal.
         let embed_model = models
             .as_ref()
-            .and_then(|m| m.iter().find(|s| s.contains("embed")).cloned())
-            .unwrap_or_else(|| "nomic-embed-text".to_string());
+            .and_then(|m| m.iter().find(|s| s.to_lowercase().contains("embed")).cloned());
 
-        match self.embed(&embed_model, "ping").await {
-            Ok(_) => {
-                status.embeddings = true;
+        match embed_model {
+            None => {
+                status.embeddings_error = Some(
+                    "Endpoint didn't advertise any embedding model (nothing containing 'embed' in /models). Check Settings → LLM Routing (Embedding) for the exact model your server is serving.".to_string(),
+                );
             }
-            Err(e) => {
-                status.embeddings_error = Some(e.to_string());
-            }
+            Some(name) => match self.embed(&name, "ping").await {
+                Ok(_) => {
+                    status.embeddings = true;
+                }
+                Err(e) => {
+                    status.embeddings_error = Some(e.to_string());
+                }
+            },
         }
 
         Ok(status)
