@@ -625,7 +625,7 @@ pub async fn ask_question(
         let mut stmt = conn
             .prepare(
                 "SELECT message_id, text_content FROM message_index
-                 WHERE conversation_id = ?1 AND is_system = 0
+                 WHERE conversation_id = ?1 AND role = 'user'
                  ORDER BY create_time ASC LIMIT 15",
             )
             .map_err(|e| e.to_string())?;

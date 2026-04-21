@@ -271,6 +271,8 @@ function App() {
   const [cloudModels, setCloudModels] = useState<string[]>([]);
   const storeRef = useRef<any>(null);
   const extractionAbortRef = useRef<{ stopped: boolean }>({ stopped: false });
+  const lastGraphRefreshAtRef = useRef<number>(0);
+  const lastGraphSigRef = useRef<string>("");
 
   // Re-fetch the cloud provider's model list when credentials change. Filter
   // out embedding models so chat/extraction defaults never pick `text-embedding-*`.
@@ -511,6 +513,7 @@ function App() {
         // N×pending cloud timeouts when the primary is hard-down.
         let usingBackup = false;
         let fallbackNoticed = false;
+        let fallbackTriggerError: string | null = null;
 
         const runTarget = async (t: Target, id: string) => {
           agentLog("A", "src/App.tsx:runTarget", "invoke_extract_conversation", {
@@ -540,10 +543,11 @@ function App() {
             const idx = cursor++;
             if (idx >= pending.length) return;
             const id = pending[idx];
+            const startedOnBackupOnly = usingBackup && configuredTargets.length > 1;
 
             // If we've already proved the primary is broken, skip straight to
             // backup(s). Otherwise walk the full target list in order.
-            const targets: Target[] = usingBackup && configuredTargets.length > 1
+            const targets: Target[] = startedOnBackupOnly
               ? configuredTargets.slice(1)
               : configuredTargets;
 
@@ -574,6 +578,7 @@ function App() {
                 const isPrimary = !usingBackup && ti === 0;
                 if (isPrimary && configuredTargets.length > 1) {
                   usingBackup = true;
+                  fallbackTriggerError = `${t.kind}(${t.model}): ${String(e).slice(0, 300)}`;
                   if (!fallbackNoticed) {
                     fallbackNoticed = true;
                     setRoutingNotice(
@@ -593,10 +598,20 @@ function App() {
             } else {
               failed++;
               done++;
-              const combined = `All endpoints failed. ${errs.join(' | ')}`;
+              const combinedParts: string[] = [];
+              if (startedOnBackupOnly && fallbackTriggerError) {
+                combinedParts.push(
+                  `Primary target failed earlier in this sync, so this conversation ran on backup only. ${fallbackTriggerError}`
+                );
+              }
+              if (errs.length > 0) {
+                combinedParts.push(errs.join(' | '));
+              }
+              const combined = `All endpoints failed. ${combinedParts.join(' | ')}`;
               console.warn(`[extraction ${source}] ${id} failed on all targets: ${combined}`);
               // Persist the combined error so the Failed Extractions list
-              // shows *why both* attempts failed, not just the last one.
+              // shows the original primary-target failure that triggered
+              // sticky fallback, not just the later backup-only error.
               await invoke("record_extraction_failure", {
                 workspacePath: workspace,
                 conversationId: id,
@@ -610,6 +625,25 @@ function App() {
               total: pending.length,
               failed,
             });
+
+            // Incremental graph refresh: long syncs otherwise "look stuck" even
+            // though backend commits are happening. Throttle to at most once
+            // every ~2 seconds and only every few completed items.
+            if (workspace && !setupMode && (done % 5 === 0 || done === pending.length)) {
+              const now = Date.now();
+              if (now - lastGraphRefreshAtRef.current > 2000) {
+                lastGraphRefreshAtRef.current = now;
+                console.info(`[graph-refresh] incremental refresh at done=${done}/${pending.length}`);
+                invoke("get_initial_graph", { workspacePath: workspace })
+                  .then((data: any) => {
+                    if (data && data.nodes && data.nodes.length > 0) {
+                      setHasArchive(true);
+                      setGraphData(data);
+                    }
+                  })
+                  .catch((e) => console.warn("[graph-refresh] incremental refresh failed:", e));
+              }
+            }
           }
         };
 
@@ -623,6 +657,19 @@ function App() {
       } finally {
         setExtractionRunning(false);
         setExtractionStopping(false);
+        // Refresh the visible graph snapshot after extraction commits so the
+        // UI reflects newly created nodes/edges without requiring a restart.
+        if (workspace && !setupMode) {
+          console.info("[graph-refresh] final refresh after extraction worker finished");
+          invoke("get_initial_graph", { workspacePath: workspace })
+            .then((data: any) => {
+              if (data && data.nodes && data.nodes.length > 0) {
+                setHasArchive(true);
+                setGraphData(data);
+              }
+            })
+            .catch((e) => console.error("get_initial_graph refresh failed:", e));
+        }
       }
     },
     [workspace, extractionRunning, config, resolveJobTargets]
@@ -673,6 +720,7 @@ function App() {
             setHasArchive(false);
           } else {
             setHasArchive(true);
+            lastGraphSigRef.current = `${data.nodes?.length ?? 0}:${data.links?.length ?? 0}`;
             setGraphData(data);
           }
         })
@@ -682,6 +730,26 @@ function App() {
         });
     }
   }, [workspace, setupMode]);
+
+  // While extraction is running, poll for graph updates so newly committed
+  // nodes/edges appear without waiting for a full page reload or worker finish.
+  useEffect(() => {
+    if (!workspace || setupMode || !extractionRunning) return;
+    const id = setInterval(() => {
+      invoke("get_initial_graph", { workspacePath: workspace })
+        .then((data: any) => {
+          if (data && data.nodes && data.nodes.length > 0) {
+            const sig = `${data.nodes?.length ?? 0}:${data.links?.length ?? 0}`;
+            if (sig === lastGraphSigRef.current) return;
+            lastGraphSigRef.current = sig;
+            setHasArchive(true);
+            setGraphData(data);
+          }
+        })
+        .catch(() => {});
+    }, 2500);
+    return () => clearInterval(id);
+  }, [workspace, setupMode, extractionRunning]);
 
   useEffect(() => {
     if (workspace && hasArchive === false) {

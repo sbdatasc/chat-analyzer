@@ -1,6 +1,7 @@
 pub mod db;
 pub mod ingest;
 pub mod llm;
+pub mod kg;
 pub mod graph;
 pub mod search;
 pub mod workbench;

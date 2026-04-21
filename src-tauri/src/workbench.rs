@@ -43,7 +43,7 @@ pub async fn get_conversation_workbench(
     // 1. Fetch messages
     let mut messages = Vec::new();
     let mut stmt_msgs = conn
-        .prepare("SELECT message_id, role, text_content FROM message_index WHERE conversation_id = ?1 ORDER BY create_time ASC")
+        .prepare("SELECT message_id, role, text_content FROM message_index WHERE conversation_id = ?1 AND role = 'user' ORDER BY create_time ASC")
         .map_err(|e| e.to_string())?;
     
     let mut rows_msgs = stmt_msgs.query(params![conversation_id]).map_err(|e| e.to_string())?;

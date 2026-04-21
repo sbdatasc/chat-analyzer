@@ -138,7 +138,7 @@ pub fn process_export_file(
 
         let mut turn_count: i64 = 0;
         let mut branch_count: i64 = 0;
-        let mut has_non_system = false;
+        let mut has_user_message = false;
         let mut models: HashSet<String> = HashSet::new();
 
         for (node_id, node_val) in mapping {
@@ -161,15 +161,6 @@ pub fn process_export_file(
                 .and_then(|a| a.get("role"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
-            let is_system = if role == "system" { 1 } else { 0 };
-            if role != "system" {
-                has_non_system = true;
-                turn_count += 1;
-            }
-
-            let on_visible_path = if visible.contains(node_id) { 1 } else { 0 };
-            let parent_id = node_val.get("parent").and_then(|v| v.as_str());
-            let cr_time = msg.get("create_time").and_then(|v| v.as_f64());
             let model = msg
                 .get("metadata")
                 .and_then(|m| m.get("model_slug"))
@@ -178,6 +169,17 @@ pub fn process_export_file(
             if model != "unknown" {
                 models.insert(model.to_string());
             }
+
+            if role != "user" {
+                continue;
+            }
+
+            has_user_message = true;
+            turn_count += 1;
+
+            let on_visible_path = if visible.contains(node_id) { 1 } else { 0 };
+            let parent_id = node_val.get("parent").and_then(|v| v.as_str());
+            let cr_time = msg.get("create_time").and_then(|v| v.as_f64());
 
             let parts = msg
                 .get("content")
@@ -212,12 +214,12 @@ pub fn process_export_file(
                     compressed,
                     source_id,
                     on_visible_path,
-                    is_system
+                    0
                 ],
             )?;
         }
 
-        if !has_non_system {
+        if !has_user_message {
             skipped += 1;
             continue;
         }

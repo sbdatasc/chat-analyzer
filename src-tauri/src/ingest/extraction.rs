@@ -1,6 +1,7 @@
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use anyhow::{Result, anyhow};
 use crate::llm::{LlmClient, Message, ChatOpts};
+use crate::kg::extraction::sanitize_extraction_output;
 use serde_json::{Value, json};
 use std::path::Path;
 use std::time::Instant;
@@ -607,7 +608,7 @@ async fn do_extract(
         )?;
         let mut stmt = db.prepare(
             "SELECT message_id, text_content, role FROM message_index
-             WHERE conversation_id = ?1 AND is_system = 0 AND on_visible_path = 1
+             WHERE conversation_id = ?1 AND role = 'user' AND on_visible_path = 1
              ORDER BY create_time ASC",
         )?;
         let mut rows = stmt.query(params![conversation_id])?;
@@ -861,38 +862,29 @@ async fn do_extract(
         t_start.elapsed().as_secs_f32()
     );
 
+    let sanitized = sanitize_extraction_output(json_output.clone())?;
     eprintln!(
         "[extract {}] chat returned, parsing {} topic / {} entity / {} concept / {} pattern",
         conversation_id,
-        json_output.get("topics").and_then(|v| v.as_array()).map_or(0, |a| a.len()),
-        json_output.get("entities").and_then(|v| v.as_array()).map_or(0, |a| a.len()),
-        json_output.get("concepts").and_then(|v| v.as_array()).map_or(0, |a| a.len()),
-        json_output.get("prompt_patterns").and_then(|v| v.as_array()).map_or(0, |a| a.len())
+        sanitized.topics.len(),
+        sanitized.entities.len(),
+        sanitized.concepts.len(),
+        sanitized.prompt_patterns.len()
     );
 
-    let kinds = [
-        ("topic", "topics"),
-        ("entity", "entities"),
-        ("concept", "concepts"),
-        ("pattern", "prompt_patterns"),
-    ];
-
     let mut proposals: Vec<Proposed> = Vec::new();
-    for (kind, key) in kinds {
-        if let Some(arr) = json_output.get(key).and_then(|v| v.as_array()) {
-            for item in arr {
-                if item
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .map(|v| v.trim().is_empty())
-                    .unwrap_or(true)
-                {
-                    continue;
-                }
-                let confidence = item.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                proposals.push(parse_proposal(kind, item.clone(), confidence)?);
-            }
-        }
+    // Convert sanitized output back into the internal proposal representation.
+    for item in sanitized.topics {
+        proposals.push(parse_proposal("topic", item.raw, item.confidence)?);
+    }
+    for item in sanitized.entities {
+        proposals.push(parse_proposal("entity", item.raw, item.confidence)?);
+    }
+    for item in sanitized.concepts {
+        proposals.push(parse_proposal("concept", item.raw, item.confidence)?);
+    }
+    for item in sanitized.prompt_patterns {
+        proposals.push(parse_proposal("pattern", item.raw, item.confidence)?);
     }
 
     // Batch embed everything that needs it in one HTTP call, then run the
@@ -963,6 +955,17 @@ async fn do_extract(
         });
     }
 
+    let parked = decisions.iter().filter(|d| d.proposal.confidence < PARKED_THRESHOLD).count();
+    let solid = decisions.len().saturating_sub(parked);
+    eprintln!(
+        "[extract {}] decisions: total={}, solid={}, parked={} (threshold={:.2})",
+        conversation_id,
+        decisions.len(),
+        solid,
+        parked,
+        PARKED_THRESHOLD
+    );
+
     let mut db = Connection::open(db_path)?;
     let tx = db.transaction()?;
     let now = chrono::Utc::now().to_rfc3339();
@@ -972,7 +975,15 @@ async fn do_extract(
         upsert_decision(&tx, conversation_id, d, &now, false, false)?;
     }
 
+    // Ensure the conversation itself becomes "recent" after extraction so
+    // graph views seeded by recent conversations include newly derived nodes.
+    let _ = tx.execute(
+        "UPDATE node SET updated = ?1 WHERE id = ?2",
+        params![&now, conversation_id],
+    );
+
     tx.commit()?;
+    eprintln!("[extract {}] commit complete", conversation_id);
     Ok(())
 }
 

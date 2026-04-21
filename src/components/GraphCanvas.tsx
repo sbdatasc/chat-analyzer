@@ -39,6 +39,8 @@ export function GraphCanvas({
   const [dimensions, setDimensions] = useState({ width: 800, height: 600 });
   const zoomLevelRef = useRef(1);
   const pendingAutoFitRef = useRef(false);
+  const lastAutoFitSigRef = useRef<string>("");
+  const userInteractedRef = useRef(false);
 
   const [hoverNode, setHoverNode] = useState<GraphNode | null>(null);
   const [activeNode, setActiveNode] = useState<GraphNode | null>(null);
@@ -100,8 +102,17 @@ export function GraphCanvas({
 
   useEffect(() => {
     if (!data || data.nodes.length === 0) return;
+    // Polling refresh can update `data` frequently without real graph changes.
+    // Auto-fitting on every update causes jitter and makes the graph feel broken.
+    // Only auto-fit when the "shape" changes.
+    const sig = `${data.nodes.length}:${data.links.length}`;
+    if (sig === lastAutoFitSigRef.current) return;
+    lastAutoFitSigRef.current = sig;
+
+    // Once the user interacts (pan/zoom/click), don't auto-fit again.
+    if (userInteractedRef.current) return;
+
     pendingAutoFitRef.current = true;
-    setActiveNode(null);
     const raf = requestAnimationFrame(() => fitToView(0));
     return () => cancelAnimationFrame(raf);
   }, [data, dimensions.width, dimensions.height, fitToView]);
@@ -117,6 +128,7 @@ export function GraphCanvas({
   // Handle focus pan/zoom
   const handleNodeClick = useCallback(
     (node: GraphNode) => {
+      userInteractedRef.current = true;
       setActiveNode(node === activeNode ? null : node);
       if (fgRef.current) {
         if (node !== activeNode) {
@@ -241,8 +253,12 @@ export function GraphCanvas({
         nodeCanvasObject={paintNode}
         onNodeClick={handleNodeClick}
         onNodeHover={(n: any) => setHoverNode(n || null)}
-        onBackgroundClick={() => setActiveNode(null)}
+        onBackgroundClick={() => {
+          userInteractedRef.current = true;
+          setActiveNode(null);
+        }}
         onZoomEnd={({ k }) => {
+          userInteractedRef.current = true;
           zoomLevelRef.current = k;
         }}
         onEngineStop={() => {

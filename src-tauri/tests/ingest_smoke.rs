@@ -164,9 +164,9 @@ fn end_to_end_ingest_populates_tables() {
     };
     assert_eq!(count_sr, 1);
     assert_eq!(count_conv, 2, "two conversation nodes");
-    assert!(count_msg >= 5, "at least 5 messages indexed, got {}", count_msg);
+    assert_eq!(count_msg, 3, "only user-authored messages are indexed");
 
-    // Visible-path walk covers the final message of each conversation.
+    // Visible-path walk covers the user-authored visible path.
     let visible: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM message_index WHERE on_visible_path = 1",
@@ -174,13 +174,9 @@ fn end_to_end_ingest_populates_tables() {
             |r| r.get(0),
         )
         .unwrap();
-    assert!(
-        visible >= 4,
-        "visible_path should cover >=4 messages, got {}",
-        visible
-    );
+    assert_eq!(visible, 3, "visible_path should cover the 3 stored user messages");
 
-    // System message flagged
+    // User-only ingest means no system rows are stored.
     let system: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM message_index WHERE is_system = 1",
@@ -188,7 +184,15 @@ fn end_to_end_ingest_populates_tables() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(system, 1, "exactly one system message flagged");
+    assert_eq!(system, 0, "system messages are excluded from the archive");
+    let non_user: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM message_index WHERE role != 'user'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(non_user, 0, "assistant/system rows are not stored");
 
     // extraction_state has pending rows
     let pending: i64 = conn

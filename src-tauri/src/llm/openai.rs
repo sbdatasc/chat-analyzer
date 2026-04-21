@@ -174,6 +174,30 @@ fn coerce_message_from_openai_choice(choice: &Value) -> String {
     String::new()
 }
 
+/// True for models that burn output tokens on hidden reasoning before producing
+/// visible content. These need a much larger `max_tokens` than the task itself
+/// would suggest — otherwise the entire budget is consumed thinking and the
+/// response comes back empty (HTTP 200, `finish_reason: MAX_TOKENS`, no text).
+fn model_is_thinking(name: &str) -> bool {
+    let n = name.to_lowercase();
+    // OpenAI-compat model IDs may include the `models/` prefix via Gemini;
+    // strip it so prefix matches work.
+    let n = n.strip_prefix("models/").unwrap_or(&n);
+    if n.contains("thinking") || n.contains("reasoning") {
+        return true;
+    }
+    // Gemini 2.5 Pro is a thinking model by default; flash variants aren't
+    // unless the name contains `-thinking`.
+    if n.starts_with("gemini-2.5-pro") || n == "gemini-2.5-pro" {
+        return true;
+    }
+    // OpenAI o-series reasoning models.
+    if n == "o1" || n == "o3" || n == "o4" || n.starts_with("o1-") || n.starts_with("o3-") || n.starts_with("o4-") {
+        return true;
+    }
+    false
+}
+
 // Spec §14: 3 attempts with 1s/3s/9s exponential backoff. The 9s wait would
 // precede a 4th attempt, so we sleep 1s before attempt 2 and 3s before attempt 3.
 async fn with_retry<F, Fut, T>(mut op: F) -> Result<T>
@@ -253,9 +277,22 @@ impl LlmClient for OpenAiCompatibleClient {
             );
         }
         if let Some(limit) = opts.max_tokens {
+            // Thinking / reasoning models (Gemini 2.5-pro, OpenAI o-series,
+            // any *-thinking / *-reasoning variant) consume output tokens on
+            // hidden chain-of-thought BEFORE producing the visible answer.
+            // A 900-token cap is entirely eaten by thinking, and the OpenAI-
+            // compat layer returns HTTP 200 with content_len=0. Guarantee
+            // these models a large enough budget that visible output actually
+            // makes it out. Non-thinking models ignore the larger cap (they
+            // stop when done), so this is safe.
+            let adjusted = if !self.is_ollama && model_is_thinking(model) {
+                limit.max(8000)
+            } else {
+                limit
+            };
             body.as_object_mut()
                 .unwrap()
-                .insert("max_tokens".to_string(), json!(limit));
+                .insert("max_tokens".to_string(), json!(adjusted));
         }
 
         let url = format!("{}/chat/completions", self.base_url);
