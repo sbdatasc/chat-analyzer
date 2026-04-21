@@ -48,39 +48,23 @@ export type WorkspaceConfig = {
 
 export type JobKey = keyof WorkspaceConfig["jobs"];
 
-// Hard-coded provider → base URL mapping so the user never touches the URL.
-export const CLOUD_PROVIDERS: Record<CloudProvider, { label: string; base_url: string; default_models: { chat: string; extraction: string; triage: string } }> = {
+// Provider → base URL mapping. Infrastructure only: the URL is determined by
+// the provider identity (you can't call OpenAI at a Gemini URL). No model
+// names live here — the only source of truth for models is Settings →
+// LLM Routing, populated live from the provider's own /models endpoint.
+export const CLOUD_PROVIDERS: Record<CloudProvider, { label: string; base_url: string }> = {
   openai: {
     label: 'OpenAI',
     base_url: 'https://api.openai.com/v1',
-    default_models: { chat: 'gpt-4o-mini', extraction: 'gpt-4o-mini', triage: 'gpt-4o-mini' },
   },
   gemini: {
     label: 'Google Gemini',
     base_url: 'https://generativelanguage.googleapis.com/v1beta/openai',
-    default_models: { chat: 'gemini-2.0-flash', extraction: 'gemini-2.0-flash', triage: 'gemini-2.0-flash' },
   },
   custom: {
     label: 'Custom (OpenAI-compatible)',
     base_url: '',
-    default_models: { chat: '', extraction: '', triage: '' },
   },
-};
-
-const LOCAL_JOB_DEFAULTS: Record<JobKey, string> = {
-  extraction: "qwen2.5:7b",
-  embedding: "nomic-embed-text",
-  triage_preview: "qwen2.5:3b",
-  evaluation: "qwen2.5:7b",
-  chat: "qwen2.5:7b",
-};
-
-const CLOUD_JOB_DEFAULT_KIND: Record<JobKey, "chat" | "extraction" | "triage"> = {
-  extraction: "extraction",
-  embedding: "extraction",
-  triage_preview: "triage",
-  evaluation: "extraction",
-  chat: "chat",
 };
 
 export function isCloudConfigured(cfg: WorkspaceConfig | null | undefined): boolean {
@@ -89,31 +73,9 @@ export function isCloudConfigured(cfg: WorkspaceConfig | null | undefined): bool
   return Boolean(c?.base_url && c?.api_key);
 }
 
-// A concrete endpoint+model pair a job can run against. The triage model is
-// derived here because the backend uses one client for both extraction and
-// triage — on cloud, triage must be the cloud model too, or it 404s.
+// A concrete endpoint+model pair a job can run against. Both fields are exactly
+// what the user configured in Settings — no substitution, no heuristics.
 export type Target = { ep: EndpointConfig; model: string; triage: string; kind: 'default' | 'cloud' };
-
-// Heuristics for detecting when a stored model name is obviously wrong for
-// the target endpoint. Ollama uses `name:tag` slugs (qwen2.5:3b, llama3:8b);
-// OpenAI/Gemini/Anthropic use flat names (gpt-4o-mini, gemini-2.0-flash).
-// We use these to auto-correct stale configs rather than sending a guaranteed
-// 404 to the provider.
-const LOCAL_MODEL_HINTS = ['qwen', 'llama', 'mistral', 'gemma', 'phi', 'nomic', 'deepseek', 'codellama', 'tinyllama'];
-const CLOUD_MODEL_HINTS = ['gpt-', 'gemini-', 'claude-', 'o1-', 'o3-', 'o4-', 'text-embedding-', 'davinci', 'babbage', 'ada'];
-
-export function modelLooksLocal(model: string): boolean {
-  if (!model) return false;
-  const m = model.toLowerCase();
-  if (m.includes(':')) return true; // Ollama tag format — never valid on cloud
-  return LOCAL_MODEL_HINTS.some((h) => m.startsWith(h));
-}
-
-export function modelLooksCloud(model: string): boolean {
-  if (!model) return false;
-  const m = model.toLowerCase();
-  return CLOUD_MODEL_HINTS.some((h) => m.startsWith(h));
-}
 
 export function inferCloudProvider(cloud: EndpointConfig | null | undefined): CloudProvider {
   const stored = cloud?.provider as CloudProvider | undefined;
@@ -122,82 +84,6 @@ export function inferCloudProvider(cloud: EndpointConfig | null | undefined): Cl
   if (url.startsWith(CLOUD_PROVIDERS.openai.base_url)) return "openai";
   if (url.startsWith(CLOUD_PROVIDERS.gemini.base_url)) return "gemini";
   return url ? "custom" : "gemini";
-}
-
-export function defaultModelForJob(
-  job: JobKey,
-  endpoint: string,
-  cfg: WorkspaceConfig | null | undefined
-): string {
-  const normalizedEndpoint = endpoint === "local" ? "default" : endpoint;
-  if (normalizedEndpoint === "cloud") {
-    const provider = inferCloudProvider(cfg?.endpoints.cloud);
-    return CLOUD_PROVIDERS[provider].default_models[CLOUD_JOB_DEFAULT_KIND[job]] || "";
-  }
-  return LOCAL_JOB_DEFAULTS[job] || "";
-}
-
-function normalizeModelForTarget(
-  job: JobKey,
-  endpoint: string,
-  rawModel: string,
-  cfg: WorkspaceConfig | null | undefined
-): string {
-  const normalizedEndpoint = endpoint === "local" ? "default" : endpoint;
-  const model = rawModel.trim();
-
-  if (normalizedEndpoint === "cloud") {
-    const provider = inferCloudProvider(cfg?.endpoints.cloud);
-    if (!model) {
-      return defaultModelForJob(job, "cloud", cfg);
-    }
-    if (provider !== "custom" && modelLooksLocal(model)) {
-      return defaultModelForJob(job, "cloud", cfg);
-    }
-    return model;
-  }
-
-  if (normalizedEndpoint === "default" || normalizedEndpoint === "") {
-    if (!model || modelLooksCloud(model)) {
-      return defaultModelForJob(job, "default", cfg);
-    }
-    return model;
-  }
-
-  return model;
-}
-
-export function normalizeWorkspaceConfig(cfg: WorkspaceConfig): WorkspaceConfig {
-  const normalizeJob = (jobKey: JobKey, job: JobConfig): JobConfig => {
-    const endpoint = job.endpoint === "local" ? "default" : (job.endpoint || "default");
-    const backupEndpoint =
-      job.backup_endpoint === "none"
-        ? ""
-        : job.backup_endpoint === "local"
-          ? "default"
-          : (job.backup_endpoint || "");
-
-    return {
-      ...job,
-      endpoint,
-      model: normalizeModelForTarget(jobKey, endpoint, job.model || "", cfg),
-      backup_endpoint: backupEndpoint,
-      backup_model: backupEndpoint
-        ? normalizeModelForTarget(jobKey, backupEndpoint, job.backup_model || "", cfg)
-        : "",
-    };
-  };
-
-  return {
-    ...cfg,
-    jobs: {
-      extraction: normalizeJob("extraction", cfg.jobs.extraction),
-      embedding: normalizeJob("embedding", cfg.jobs.embedding),
-      triage_preview: normalizeJob("triage_preview", cfg.jobs.triage_preview),
-      evaluation: normalizeJob("evaluation", cfg.jobs.evaluation),
-      chat: normalizeJob("chat", cfg.jobs.chat),
-    },
-  };
 }
 
 function summarizeRoutingFailure(err: unknown): string {
