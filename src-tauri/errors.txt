@@ -1,0 +1,85 @@
+    Checking tauri-app v0.1.0 (/Users/saurav/projects/apps/chat-analyzer/src-tauri)
+error[E0432]: unresolved import `anyhow`
+ --> src/ingest/parser.rs:7:5
+  |
+7 | use anyhow::{Result, Context};
+  |     ^^^^^^ use of unresolved module or unlinked crate `anyhow`
+  |
+  = help: if you wanted to use a crate named `anyhow`, use `cargo add anyhow` to add it to your `Cargo.toml`
+
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `anyhow`
+  --> src/ingest/parser.rs:37:20
+   |
+37 |         return Err(anyhow::anyhow!("Already imported this file."));
+   |                    ^^^^^^ use of unresolved module or unlinked crate `anyhow`
+
+warning: unused import: `BufReader`
+ --> src/ingest/parser.rs:2:15
+  |
+2 | use std::io::{BufReader, Read};
+  |               ^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `std::collections::HashMap`
+ --> src/ingest/parser.rs:3:5
+  |
+3 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `SystemTime`
+  --> src/ingest/parser.rs:10:17
+   |
+10 | use std::time::{SystemTime, UNIX_EPOCH};
+   |                 ^^^^^^^^^^
+
+warning: unused imports: `AppHandle` and `State`
+ --> src/lib.rs:6:13
+  |
+6 | use tauri::{AppHandle, command, State};
+  |             ^^^^^^^^^           ^^^^^
+
+warning: unused import: `serde_json::json`
+ --> src/lib.rs:7:5
+  |
+7 | use serde_json::json;
+  |     ^^^^^^^^^^^^^^^^
+
+error[E0282]: type annotations needed
+  --> src/lib.rs:16:19
+   |
+16 |         .map_err(|e| e.to_string())
+   |                   ^  - type must be known at this point
+   |
+help: consider giving this closure parameter an explicit type
+   |
+16 |         .map_err(|e: /* Type */| e.to_string())
+   |                    ++++++++++++
+
+error[E0599]: no method named `db_sqlite3` found for struct `Connection` in the current scope
+  --> src/db.rs:10:31
+   |
+10 |         sqlite3_vec_init(conn.db_sqlite3());
+   |                               ^^^^^^^^^^ method not found in `Connection`
+
+error[E0061]: this function takes 0 arguments but 1 argument was supplied
+  --> src/db.rs:10:9
+   |
+10 |         sqlite3_vec_init(conn.db_sqlite3());
+   |         ^^^^^^^^^^^^^^^^ ----------------- unexpected argument
+   |
+note: function defined here
+  --> /Users/saurav/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sqlite-vec-0.1.9/src/lib.rs:3:12
+   |
+ 3 |     pub fn sqlite3_vec_init();
+   |            ^^^^^^^^^^^^^^^^
+help: remove the extra argument
+   |
+10 -         sqlite3_vec_init(conn.db_sqlite3());
+10 +         sqlite3_vec_init();
+   |
+
+Some errors have detailed explanations: E0061, E0282, E0432, E0433, E0599.
+For more information about an error, try `rustc --explain E0061`.
+warning: `tauri-app` (lib) generated 5 warnings
+error: could not compile `tauri-app` (lib) due to 5 previous errors; 5 warnings emitted

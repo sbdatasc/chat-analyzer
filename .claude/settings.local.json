@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx tsc *)",
+      "Bash(echo \"TSC=$?\")",
+      "Bash(cargo check *)",
+      "Bash(echo \"CARGO=$?\")",
+      "Bash(echo \"EXIT=$?\")",
+      "Bash(cargo test *)",
+      "Bash(npm install *)",
+      "Bash(npm run *)",
+      "Bash(npx tauri *)",
+      "Bash(hdiutil info *)",
+      "Bash(git init:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
+    ]
+  }
+}

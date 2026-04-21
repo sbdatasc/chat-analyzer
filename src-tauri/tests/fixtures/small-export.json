@@ -1,0 +1,82 @@
+[
+  {
+    "id": "conv-1",
+    "title": "Getting started with Cairn",
+    "create_time": 1700000000.0,
+    "update_time": 1700001000.0,
+    "current_node": "msg-3",
+    "mapping": {
+      "root": { "parent": null, "children": ["msg-0"], "message": null },
+      "msg-0": {
+        "parent": "root",
+        "children": ["msg-1"],
+        "message": {
+          "author": { "role": "system" },
+          "create_time": 1700000000.0,
+          "content": { "parts": ["system preamble"] },
+          "metadata": {}
+        }
+      },
+      "msg-1": {
+        "parent": "msg-0",
+        "children": ["msg-2"],
+        "message": {
+          "author": { "role": "user" },
+          "create_time": 1700000010.0,
+          "content": { "parts": ["How do I use Ollama with a local vector store?"] },
+          "metadata": {}
+        }
+      },
+      "msg-2": {
+        "parent": "msg-1",
+        "children": ["msg-3"],
+        "message": {
+          "author": { "role": "assistant" },
+          "create_time": 1700000020.0,
+          "content": { "parts": ["Ollama provides an OpenAI-compatible HTTP API on localhost:11434."] },
+          "metadata": { "model_slug": "qwen2.5:7b" }
+        }
+      },
+      "msg-3": {
+        "parent": "msg-2",
+        "children": [],
+        "message": {
+          "author": { "role": "user" },
+          "create_time": 1700000030.0,
+          "content": { "parts": ["Got it, thanks."] },
+          "metadata": {}
+        }
+      }
+    }
+  },
+  {
+    "id": "conv-2",
+    "title": "Knowledge graph fundamentals",
+    "create_time": 1700100000.0,
+    "update_time": 1700100500.0,
+    "current_node": "msg-b",
+    "mapping": {
+      "root": { "parent": null, "children": ["msg-a"], "message": null },
+      "msg-a": {
+        "parent": "root",
+        "children": ["msg-b"],
+        "message": {
+          "author": { "role": "user" },
+          "create_time": 1700100000.0,
+          "content": { "parts": ["Explain semantic dedup in a knowledge graph."] },
+          "metadata": {}
+        }
+      },
+      "msg-b": {
+        "parent": "msg-a",
+        "children": [],
+        "message": {
+          "author": { "role": "assistant" },
+          "create_time": 1700100100.0,
+          "content": { "parts": ["Semantic dedup uses embedding similarity to merge near-duplicate entities before creating new nodes."] },
+          "metadata": { "model_slug": "qwen2.5:7b" }
+        }
+      }
+    }
+  }
+]

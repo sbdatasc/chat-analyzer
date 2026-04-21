@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- 
+    Bottom: width 320, height 96, r 20, center, 0 deg
+    Center is X: 256. Top is Y = 512 - 64 padding - 96 = 352?
+    Wait, let's reverse from Bottom.
+    Bottom center is 512 - 64 = 448 (Y axis bottom edge).
+    So Bottom Y = 448 - 96 = 352
+    Bottom X = 256 - 160 = 96
+  -->
+  <g fill="#C5894B">
+    <rect x="96" y="352" width="320" height="96" rx="20" />
+    
+    <!-- 
+      Middle: width 240, height 88, r 18, X offset +6, rot -1 deg
+      Middle bottom edge sits on top of Bottom + 8px gap? Wait, the specs say "8px vertical gap".
+      So Middle bottom Y = Bottom top Y (352) - 8 = 344
+      Middle Y = 344 - 88 = 256
+      Middle X base = 256 - 120 = 136. Adding X offset +6 = 142.
+    -->
+    <rect x="142" y="256" width="240" height="88" rx="18" transform="rotate(-1, 262, 300)" />
+    
+    <!-- 
+      Top: width 160, height 80, r 16, X offset -6, rot +1.5 deg
+      Top bottom Y = Middle top Y (256) - 8 = 248
+      Top Y = 248 - 80 = 168
+      Top X base = 256 - 80 = 176. Adding X offset -6 = 170.
+    -->
+    <rect x="170" y="168" width="160" height="80" rx="16" transform="rotate(1.5, 250, 208)" />
+  </g>
+</svg>
