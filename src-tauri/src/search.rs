@@ -147,7 +147,7 @@ fn fetch_graph_for_nodes(conn: &Connection, base_node_ids: &[String]) -> Result<
     let exp_placeholders: Vec<&str> = expanded.iter().map(|_| "?").collect();
     let exp_in_clause = exp_placeholders.join(", ");
     let query_nodes = format!(
-        "SELECT id, type, name, props FROM node WHERE id IN ({}) LIMIT ?",
+        "SELECT id, type, subtype, name, props FROM node WHERE id IN ({}) LIMIT ?",
         exp_in_clause
     );
 
@@ -161,12 +161,13 @@ fn fetch_graph_for_nodes(conn: &Connection, base_node_ids: &[String]) -> Result<
     let mut nodes = Vec::new();
     if let Ok(mut stmt) = conn.prepare(&query_nodes) {
         let iter = stmt.query_map(rusqlite::params_from_iter(node_params), |row| {
-            let props_str: Option<String> = row.get(3).unwrap_or(None);
+            let props_str: Option<String> = row.get(4).unwrap_or(None);
             let props = props_str.and_then(|s| serde_json::from_str(&s).ok());
             Ok(Node {
                 id: row.get(0)?,
                 group: row.get(1)?,
-                name: row.get(2)?,
+                subtype: row.get(2).ok(),
+                name: row.get(3)?,
                 props,
             })
         });

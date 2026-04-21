@@ -1116,6 +1116,12 @@ function App() {
                 <span className="text-[10px] font-medium text-surface bg-accent px-2 py-0.5 rounded uppercase tracking-wider">
                   {sidebarDetail?.node_type || selectedSidebarNode.group}
                 </span>
+                {/* Wiki-taxonomy subtype badge (person / tool / book / etc) */}
+                {(sidebarDetail?.subtype || selectedSidebarNode.subtype) && (
+                  <span className="text-[10px] font-medium text-accent border border-accent/40 px-2 py-0.5 rounded tracking-wider uppercase">
+                    {sidebarDetail?.subtype || selectedSidebarNode.subtype}
+                  </span>
+                )}
                 {(sidebarDetail?.tier || selectedSidebarNode.props?.tier) && (
                   <span className="text-[10px] font-medium text-text-muted border border-stone-2 px-2 py-0.5 rounded tracking-wider uppercase">
                     Tier {sidebarDetail?.tier || selectedSidebarNode.props?.tier}
@@ -1187,9 +1193,9 @@ function SidebarConnections({
   onOpenConversation,
   onFocusNode,
 }: {
-  neighbors: Array<{ id: string; name: string; node_type: string; edge_type: string; direction: string }>;
+  neighbors: Array<{ id: string; name: string; node_type: string; subtype?: string | null; edge_type: string; direction: string }>;
   onOpenConversation: (id: string) => void;
-  onFocusNode: (n: { id: string; name: string; node_type: string }) => void;
+  onFocusNode: (n: { id: string; name: string; node_type: string; subtype?: string | null }) => void;
 }) {
   // Friendlier English for the raw edge types coming from the graph schema.
   const labelFor = (edgeType: string, direction: string): string => {
@@ -1242,10 +1248,10 @@ function SidebarConnections({
                   onClick={() =>
                     n.node_type === 'conversation'
                       ? onOpenConversation(n.id)
-                      : onFocusNode({ id: n.id, name: n.name, node_type: n.node_type })
+                      : onFocusNode({ id: n.id, name: n.name, node_type: n.node_type, subtype: n.subtype })
                   }
                   className="flex items-center gap-2 text-left text-xs text-text hover:text-accent hover:bg-stone-1 rounded px-1.5 py-1 transition-colors min-w-0"
-                  title={n.name}
+                  title={n.subtype ? `${n.name} (${n.subtype})` : n.name}
                 >
                   <span
                     className={`w-1.5 h-1.5 rounded-full shrink-0 ${
@@ -1255,13 +1261,19 @@ function SidebarConnections({
                           ? 'bg-accent'
                           : n.node_type === 'entity'
                             ? 'bg-flag-green'
-                            : n.node_type === 'concept'
-                              ? 'bg-flag-amber'
-                              : 'bg-stone-2'
+                            : n.node_type === 'source'
+                              ? 'bg-flag-red'
+                              : n.node_type === 'concept'
+                                ? 'bg-flag-amber'
+                                : 'bg-stone-2'
                     }`}
                   />
                   <span className="truncate flex-1">{n.name}</span>
-                  <span className="text-[9px] text-text-muted uppercase tracking-wider shrink-0">{n.node_type}</span>
+                  {/* subtype (person/tool/book/etc) wins over the generic node_type
+                      label when present — it's the richer answer to "what is this?". */}
+                  <span className="text-[9px] text-text-muted uppercase tracking-wider shrink-0">
+                    {n.subtype || n.node_type}
+                  </span>
                 </button>
               ))}
             </div>

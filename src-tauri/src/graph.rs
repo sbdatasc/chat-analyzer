@@ -8,6 +8,11 @@ use std::io::Write;
 pub struct Node {
     pub id: String,
     pub group: String,
+    /// Wiki-taxonomy refinement: e.g. group="entity", subtype="person";
+    /// group="source", subtype="book"; group="concept", subtype="pattern".
+    /// Null for topics and un-classified legacy rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subtype: Option<String>,
     pub name: String,
     pub props: Option<serde_json::Value>,
 }
@@ -150,7 +155,7 @@ pub fn get_initial_graph(conn: &Connection) -> Result<GraphData, String> {
     let placeholders: Vec<String> = all_ids.iter().map(|_| "?".to_string()).collect();
     let in_clause = placeholders.join(", ");
     let node_query = format!(
-        "SELECT id, type, name, props
+        "SELECT id, type, subtype, name, props
          FROM node
          WHERE id IN ({})",
         in_clause
@@ -162,12 +167,13 @@ pub fn get_initial_graph(conn: &Connection) -> Result<GraphData, String> {
     let mut nodes: Vec<Node> = Vec::new();
     if let Ok(mut nstmt) = conn.prepare(&node_query) {
         if let Ok(iter) = nstmt.query_map(rusqlite::params_from_iter(params), |row| {
-            let props_str: Option<String> = row.get(3).unwrap_or(None);
+            let props_str: Option<String> = row.get(4).unwrap_or(None);
             let props = props_str.and_then(|s| serde_json::from_str(&s).ok());
             Ok(Node {
                 id: row.get(0)?,
                 group: row.get(1)?,
-                name: row.get(2)?,
+                subtype: row.get(2).ok(),
+                name: row.get(3)?,
                 props,
             })
         }) {

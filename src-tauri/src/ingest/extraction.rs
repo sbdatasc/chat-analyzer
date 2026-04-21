@@ -406,12 +406,18 @@ fn canonical_edge_type(kind: &str) -> &'static str {
         "topic" => "belongs_to",
         "entity" => "mentions",
         "concept" => "discusses",
-        "pattern" => "uses_pattern",
+        "source" => "cites",
+        "pattern" => "uses_pattern", // legacy — migration converts these
         _ => "relates_to",
     }
 }
 
-fn parse_proposal(kind: &str, raw: Value, fallback_confidence: f64) -> Result<Proposed> {
+fn parse_proposal(
+    kind: &str,
+    subtype: Option<String>,
+    raw: Value,
+    fallback_confidence: f64,
+) -> Result<Proposed> {
     let name = raw
         .get("name")
         .and_then(|v| v.as_str())
@@ -440,6 +446,7 @@ fn parse_proposal(kind: &str, raw: Value, fallback_confidence: f64) -> Result<Pr
 
     Ok(Proposed {
         kind: kind.to_string(),
+        subtype,
         name,
         description,
         confidence: raw
@@ -459,7 +466,7 @@ fn clear_conversation_derivations(
         "SELECT DISTINCT dst_id
          FROM edge
          WHERE src_id = ?1
-           AND type IN ('belongs_to', 'mentions', 'discusses', 'uses_pattern')",
+           AND type IN ('belongs_to', 'mentions', 'discusses', 'cites', 'uses_pattern')",
     )?;
     let candidate_node_ids: Vec<String> = stmt
         .query_map(params![conversation_id], |r| r.get::<_, String>(0))?
@@ -473,7 +480,7 @@ fn clear_conversation_derivations(
     tx.execute(
         "DELETE FROM edge
          WHERE src_id = ?1
-           AND type IN ('belongs_to', 'mentions', 'discusses', 'uses_pattern')",
+           AND type IN ('belongs_to', 'mentions', 'discusses', 'cites', 'uses_pattern')",
         params![conversation_id],
     )?;
 
@@ -527,10 +534,21 @@ fn upsert_decision(
     }
 
     let node_id = if let Some(existing_id) = decision.merge_into {
-        tx.execute(
-            "UPDATE node SET updated = ?1 WHERE id = ?2",
-            params![now, &existing_id],
-        )?;
+        // If the incoming proposal has a subtype but the existing row
+        // doesn't (e.g. a pre-taxonomy extraction left it NULL), backfill it
+        // so the merged node gets the richer label. Never overwrite a
+        // subtype that's already set — preserves user-edited classifications.
+        if let Some(ref st) = p.subtype {
+            tx.execute(
+                "UPDATE node SET updated = ?1, subtype = COALESCE(subtype, ?2) WHERE id = ?3",
+                params![now, st, &existing_id],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE node SET updated = ?1 WHERE id = ?2",
+                params![now, &existing_id],
+            )?;
+        }
         existing_id
     } else {
         let new_id = uuid::Uuid::new_v4().to_string();
@@ -547,9 +565,16 @@ fn upsert_decision(
             "approved": approved_by_user,
         });
         tx.execute(
-            "INSERT INTO node (id, type, name, props, created, updated)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-            params![&new_id, p.kind, p.name, props.to_string(), now],
+            "INSERT INTO node (id, type, subtype, name, props, created, updated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+            params![
+                &new_id,
+                p.kind,
+                p.subtype.clone(),
+                p.name,
+                props.to_string(),
+                now
+            ],
         )?;
         if let Some(ref emb) = decision.embedding {
             let bytes = vec_bytes(emb);
@@ -695,6 +720,10 @@ pub async fn extract_single_conversation(
 
 struct Proposed {
     kind: String,
+    /// Wiki-taxonomy subtype: person/tool/framework/etc for entities,
+    /// book/paper/talk/etc for sources, "pattern" for concept patterns.
+    /// None for topics and untyped concepts.
+    subtype: Option<String>,
     name: String,
     description: Option<String>,
     confidence: f64,
@@ -719,10 +748,25 @@ pub async fn approve_parked_payload(
     embed_model: &str,
 ) -> Result<()> {
     let raw: Value = serde_json::from_str(payload)?;
-    let proposal = parse_proposal(kind, raw, confidence)?;
+    // Parked proposals were parked by the worker with the raw JSON the LLM
+    // emitted, so `subtype` / legacy `type` might be in there — pick whichever
+    // is present and let the rest of the pipeline store it verbatim. (The
+    // whitelist check happened when it was sanitized during the original
+    // extraction pass; we don't re-validate here to avoid silent drops on
+    // approval.)
+    let subtype = raw
+        .get("subtype")
+        .and_then(|v| v.as_str())
+        .or_else(|| raw.get("type").and_then(|v| v.as_str()))
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty());
+    let proposal = parse_proposal(kind, subtype, raw, confidence)?;
     let db_path = workspace_path.join("state").join("app.sqlite");
 
-    let embedding = if proposal.kind != "pattern" {
+    // Concept-patterns (subtype='pattern') skip embedding like the legacy
+    // top-level 'pattern' type did.
+    let is_pattern = proposal.kind == "concept" && proposal.subtype.as_deref() == Some("pattern");
+    let embedding = if !is_pattern {
         let input = match &proposal.description {
             Some(d) if !d.is_empty() => format!("{}: {}", proposal.name, d),
             _ => proposal.name.clone(),
@@ -1050,35 +1094,47 @@ async fn do_extract(
 
     let sanitized = sanitize_extraction_output(json_output.clone())?;
     eprintln!(
-        "[extract {}] chat returned, parsing {} topic / {} entity / {} concept / {} pattern",
+        "[extract {}] chat returned, parsing {} topic / {} entity / {} concept / {} source",
         conversation_id,
         sanitized.topics.len(),
         sanitized.entities.len(),
         sanitized.concepts.len(),
-        sanitized.prompt_patterns.len()
+        sanitized.sources.len()
     );
 
     let mut proposals: Vec<Proposed> = Vec::new();
     // Convert sanitized output back into the internal proposal representation.
+    // Topics never carry a subtype. Entities / sources / concepts pass theirs
+    // through so downstream persistence writes the `subtype` column.
     for item in sanitized.topics {
-        proposals.push(parse_proposal("topic", item.raw, item.confidence)?);
+        proposals.push(parse_proposal("topic", None, item.raw, item.confidence)?);
     }
     for item in sanitized.entities {
-        proposals.push(parse_proposal("entity", item.raw, item.confidence)?);
+        let subtype = item.subtype.clone();
+        proposals.push(parse_proposal("entity", subtype, item.raw, item.confidence)?);
     }
     for item in sanitized.concepts {
-        proposals.push(parse_proposal("concept", item.raw, item.confidence)?);
+        let subtype = item.subtype.clone();
+        proposals.push(parse_proposal("concept", subtype, item.raw, item.confidence)?);
     }
-    for item in sanitized.prompt_patterns {
-        proposals.push(parse_proposal("pattern", item.raw, item.confidence)?);
+    for item in sanitized.sources {
+        let subtype = item.subtype.clone();
+        proposals.push(parse_proposal("source", subtype, item.raw, item.confidence)?);
     }
 
     // Batch embed everything that needs it in one HTTP call, then run the
-    // dedup queries. Patterns use exact-name match, so they skip embeds.
+    // dedup queries. Concept-patterns (subtype='pattern') use exact-name
+    // match like the old top-level pattern type did — no embedding needed.
     let embed_indexes: Vec<usize> = proposals
         .iter()
         .enumerate()
-        .filter(|(_, p)| p.confidence >= PARKED_THRESHOLD && p.kind != "pattern")
+        .filter(|(_, p)| {
+            if p.confidence < PARKED_THRESHOLD {
+                return false;
+            }
+            let is_pattern = p.kind == "concept" && p.subtype.as_deref() == Some("pattern");
+            !is_pattern
+        })
         .map(|(i, _)| i)
         .collect();
     let embed_inputs: Vec<String> = embed_indexes
@@ -1111,11 +1167,14 @@ async fn do_extract(
             });
             continue;
         }
-        if p.kind == "pattern" {
+        // Concept-patterns dedup on exact name (they're repeatable solution
+        // shapes — if the user sees "idempotent retry" twice in different
+        // conversations, it's the same pattern). No embedding round-trip.
+        if p.kind == "concept" && p.subtype.as_deref() == Some("pattern") {
             let db = Connection::open(db_path)?;
             let existing: Option<String> = db
                 .query_row(
-                    "SELECT id FROM node WHERE type='pattern' AND name=?1 LIMIT 1",
+                    "SELECT id FROM node WHERE type='concept' AND subtype='pattern' AND name=?1 LIMIT 1",
                     params![p.name],
                     |r| r.get(0),
                 )
@@ -1174,17 +1233,20 @@ async fn do_extract(
 }
 
 fn default_extraction_prompt(title: &str, created: &str, messages: &str) -> String {
-    // Tight prompt: less prefill time for the model, same shape of output.
-    // Field definitions kept terse because downstream code handles all the
-    // thresholding and dedup — the model only needs to emit items + scores.
+    // Wiki taxonomy prompt: entities vs sources are separated so books/papers
+    // don't pollute the Entities collection. Concepts absorb "patterns" via
+    // the optional subtype field (rule #8: patterns are a concept subtype).
+    // Topics never carry a subtype. Subtype whitelist lives in kg/extraction.rs
+    // (validate_subtype) — the model emitting a value outside the whitelist
+    // is silently dropped to null there, so we can keep the prompt terse.
     format!(
-        r#"Extract a knowledge graph from this conversation as JSON.
+        r#"Extract a knowledge graph from this conversation as JSON, following a wiki taxonomy.
 
-Fields:
-- topics: 1-3 high-level subjects. lowercase-kebab names.
-- entities: named things (person|tool|org|book|tech|place).
-- concepts: atomic ideas worth remembering. max 15.
-- prompt_patterns: reusable question framings. max 3.
+Collections:
+- topics: 1-3 broad subject domains (e.g. digital-transformation, retail-banking). lowercase-kebab names. No subtype.
+- concepts: reusable idea units (e.g. idempotency, rate-limiting). max 15. Optional subtype: "pattern" for repeatable solution shapes.
+- entities: named real-world things. Required subtype — one of: person, organization, tool, product, standard, framework, technology, place. Do NOT put books/articles/papers/courses/talks here — they go in sources.
+- sources: inputs the user learns from. Required subtype — one of: book, article, paper, course, talk.
 
 Only include items DISCUSSED substantively. Confidence 0.9+=defined, 0.6-0.85=mentioned, <0.6=uncertain. Cite 1-3 message_ids each.
 
@@ -1193,8 +1255,8 @@ Date: {}
 Messages:
 {}
 
-JSON only, no prose:
-{{"topics":[{{"name":"","confidence":0.0,"message_ids":[]}}],"entities":[{{"name":"","type":"","description":"","confidence":0.0,"message_ids":[]}}],"concepts":[{{"name":"","description":"","confidence":0.0,"message_ids":[]}}],"prompt_patterns":[{{"name":"","description":"","confidence":0.0,"message_ids":[]}}]}}"#,
+JSON only, no prose. Schema:
+{{"topics":[{{"name":"","description":"","confidence":0.0,"message_ids":[]}}],"concepts":[{{"name":"","description":"","subtype":null,"confidence":0.0,"message_ids":[]}}],"entities":[{{"name":"","description":"","subtype":"","confidence":0.0,"message_ids":[]}}],"sources":[{{"name":"","description":"","subtype":"","confidence":0.0,"message_ids":[]}}]}}"#,
         title, created, messages
     )
 }
@@ -1206,7 +1268,7 @@ mod tests {
     #[test]
     fn parse_json_response_accepts_fenced_json() {
         let parsed = parse_json_response(
-            "Here you go:\n```json\n{\"topics\":[],\"entities\":[],\"concepts\":[],\"prompt_patterns\":[]}\n```",
+            "Here you go:\n```json\n{\"topics\":[],\"entities\":[],\"concepts\":[],\"sources\":[]}\n```",
         )
         .expect("fenced json should parse");
         assert!(parsed.get("topics").is_some());
@@ -1215,7 +1277,7 @@ mod tests {
     #[test]
     fn parse_json_response_extracts_balanced_object_from_prose() {
         let parsed = parse_json_response(
-            "Answer first, then JSON: {\"topics\":[],\"entities\":[],\"concepts\":[{\"name\":\"x\"}],\"prompt_patterns\":[]} trailing note",
+            "Answer first, then JSON: {\"topics\":[],\"entities\":[],\"concepts\":[{\"name\":\"x\"}],\"sources\":[]} trailing note",
         )
         .expect("embedded object should parse");
         assert_eq!(parsed["concepts"][0]["name"], "x");

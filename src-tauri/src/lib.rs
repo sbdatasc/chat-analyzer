@@ -507,6 +507,9 @@ pub struct NodeNeighbor {
     pub id: String,
     pub name: String,
     pub node_type: String,
+    /// Wiki-taxonomy subtype if present (person/tool/book/etc).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subtype: Option<String>,
     pub edge_type: String,
     pub direction: &'static str, // "incoming" (edge ends here) or "outgoing" (edge starts here)
 }
@@ -516,6 +519,8 @@ pub struct NodeDetail {
     pub id: String,
     pub name: String,
     pub node_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subtype: Option<String>,
     pub description: Option<String>,
     pub tier: Option<String>,
     pub confidence: Option<f64>,
@@ -535,11 +540,11 @@ async fn get_node_detail(
     let conn = db::open_workspace_db(Path::new(&workspace_path))
         .map_err(|e| e.to_string())?;
 
-    let (name, node_type, props_json): (String, String, Option<String>) = conn
+    let (name, node_type, subtype, props_json): (String, String, Option<String>, Option<String>) = conn
         .query_row(
-            "SELECT name, type, props FROM node WHERE id = ?1",
+            "SELECT name, type, subtype, props FROM node WHERE id = ?1",
             rusqlite::params![node_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2).ok(), r.get(3)?)),
         )
         .map_err(|e| format!("Node not found: {}", e))?;
 
@@ -576,7 +581,7 @@ async fn get_node_detail(
     // conversation that mentions it (edge type = 'mentions', src = conversation).
     let mut stmt_in = conn
         .prepare(
-            "SELECT n.id, n.name, n.type, e.type
+            "SELECT n.id, n.name, n.type, n.subtype, e.type
              FROM edge e
              JOIN node n ON n.id = e.src_id
              WHERE e.dst_id = ?1
@@ -590,7 +595,8 @@ async fn get_node_detail(
                 id: r.get(0)?,
                 name: r.get(1)?,
                 node_type: r.get(2)?,
-                edge_type: r.get(3)?,
+                subtype: r.get(3).ok(),
+                edge_type: r.get(4)?,
                 direction: "incoming",
             })
         })
@@ -603,7 +609,7 @@ async fn get_node_detail(
     // the topics / concepts / entities it discusses.
     let mut stmt_out = conn
         .prepare(
-            "SELECT n.id, n.name, n.type, e.type
+            "SELECT n.id, n.name, n.type, n.subtype, e.type
              FROM edge e
              JOIN node n ON n.id = e.dst_id
              WHERE e.src_id = ?1
@@ -617,7 +623,8 @@ async fn get_node_detail(
                 id: r.get(0)?,
                 name: r.get(1)?,
                 node_type: r.get(2)?,
-                edge_type: r.get(3)?,
+                subtype: r.get(3).ok(),
+                edge_type: r.get(4)?,
                 direction: "outgoing",
             })
         })
@@ -630,6 +637,7 @@ async fn get_node_detail(
         id: node_id,
         name,
         node_type,
+        subtype,
         description,
         tier,
         confidence,

@@ -232,5 +232,51 @@ pub fn init_db<P: AsRef<Path>>(db_path: P, vec_dim: usize) -> Result<Connection>
     );
     conn.execute_batch(&create_vec_sql)?;
 
+    // --- Schema migrations -------------------------------------------------
+    // Additive, idempotent, fully guarded by existence checks so upgrading an
+    // older workspace doesn't need any user intervention. New migrations go
+    // at the bottom so older workspaces catch up one step at a time.
+
+    // M1: add `subtype` column on `node`. Used for the wiki-style taxonomy
+    // (entity subtypes like person/tool/framework; source subtypes like
+    // book/paper/talk; concept subtype 'pattern'). Nullable — existing rows
+    // get NULL and are re-classified on the next Rebuild.
+    if !column_exists(&conn, "node", "subtype")? {
+        conn.execute_batch(
+            "ALTER TABLE node ADD COLUMN subtype TEXT;
+             CREATE INDEX IF NOT EXISTS idx_node_subtype ON node(subtype);",
+        )?;
+    }
+
+    // M2: fold top-level `pattern` nodes into `concept` with subtype='pattern',
+    // per the wiki taxonomy rule #8. Also rename the edge type so queries
+    // that look for 'discusses' pick them up naturally. Skipped if no
+    // legacy rows exist so this costs nothing on fresh workspaces.
+    let legacy_patterns: i64 = conn
+        .query_row("SELECT COUNT(*) FROM node WHERE type = 'pattern'", [], |r| r.get(0))
+        .unwrap_or(0);
+    if legacy_patterns > 0 {
+        conn.execute_batch(
+            "UPDATE node SET type = 'concept', subtype = 'pattern' WHERE type = 'pattern';
+             UPDATE OR IGNORE edge SET type = 'discusses' WHERE type = 'uses_pattern';
+             DELETE FROM edge WHERE type = 'uses_pattern';",
+        )?;
+    }
+
     Ok(conn)
+}
+
+/// True if `column` exists on `table`. Used by idempotent `ALTER TABLE ADD
+/// COLUMN` migrations — SQLite has no standard `ADD COLUMN IF NOT EXISTS`.
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let sql = format!("PRAGMA table_info({})", table);
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name.eq_ignore_ascii_case(column) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
