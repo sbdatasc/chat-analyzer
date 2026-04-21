@@ -261,31 +261,8 @@ export function SetupView({
     }
   }
 
-  const [rebuildBusy, setRebuildBusy] = useState<null | 'refresh' | 'rebuild_all'>(null);
+  const [rebuildBusy, setRebuildBusy] = useState(false);
   const [rebuildMessage, setRebuildMessage] = useState<string | null>(null);
-
-  async function handleRefreshKg() {
-    if (rebuildBusy || extractionRunning) return;
-    setRebuildBusy('refresh');
-    setRebuildMessage(null);
-    try {
-      const res = await invoke<{ conversations_requeued: number }>(
-        "rebuild_knowledge_graph",
-        { workspacePath: workspace, scope: "refresh" }
-      );
-      setRebuildMessage(
-        res.conversations_requeued > 0
-          ? `Re-queued ${res.conversations_requeued} conversations. Running Sync all…`
-          : `Nothing to refresh — no failed or skipped conversations.`
-      );
-      if (res.conversations_requeued > 0 && onSyncAll) {
-        onSyncAll();
-      }
-    } catch (e) {
-      setRebuildMessage(`Refresh failed: ${e}`);
-    }
-    setRebuildBusy(null);
-  }
 
   async function handleRebuildKg() {
     if (rebuildBusy || extractionRunning) return;
@@ -297,7 +274,7 @@ export function SetupView({
         "This typically takes a while because every conversation is re-run through the LLM."
     );
     if (!ok) return;
-    setRebuildBusy('rebuild_all');
+    setRebuildBusy(true);
     setRebuildMessage(null);
     try {
       const res = await invoke<{
@@ -305,7 +282,7 @@ export function SetupView({
         edges_deleted: number;
         parked_deleted: number;
         conversations_requeued: number;
-      }>("rebuild_knowledge_graph", { workspacePath: workspace, scope: "rebuildall" });
+      }>("rebuild_knowledge_graph", { workspacePath: workspace });
       setRebuildMessage(
         `Rebuilt: cleared ${res.derived_nodes_deleted} derived nodes, ${res.edges_deleted} edges, ${res.parked_deleted} parked items. Re-queued ${res.conversations_requeued} conversations. Starting Sync all…`
       );
@@ -313,7 +290,7 @@ export function SetupView({
     } catch (e) {
       setRebuildMessage(`Rebuild failed: ${e}`);
     }
-    setRebuildBusy(null);
+    setRebuildBusy(false);
   }
 
   // The Local health probe uses whatever base_url the user has configured.
@@ -838,40 +815,32 @@ export function SetupView({
               Re-run extraction across your imported conversations. Your ingested chats are never deleted — only the derived topics, concepts, entities, and patterns are.
             </p>
           </div>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            <div className="flex flex-col gap-2 border border-stone-1 rounded p-3 bg-surface">
-              <div>
-                <h3 className="text-xs font-semibold text-text">Refresh</h3>
-                <p className="text-[11px] text-text-muted leading-relaxed mt-1">
-                  Re-queue failed, skipped, and stale conversations only. Keeps everything that extracted successfully.
-                </p>
-              </div>
-              <button
-                onClick={handleRefreshKg}
-                disabled={!!rebuildBusy || extractionRunning}
-                className="bg-stone-1 hover:bg-stone-2 disabled:opacity-50 text-text text-xs px-3 py-2 rounded font-medium transition-colors border border-stone-2 self-start"
-              >
-                {rebuildBusy === 'refresh' ? 'Refreshing…' : 'Refresh knowledge graph'}
-              </button>
+          <div className="flex flex-col gap-2 border border-flag-amber/40 rounded p-3 bg-surface">
+            <div>
+              <h3 className="text-xs font-semibold text-flag-amber">Rebuild everything</h3>
+              <p className="text-[11px] text-text-muted leading-relaxed mt-1">
+                Wipe every extracted topic / concept / entity / source / pattern and re-run every conversation through the LLM. Costly — use after a prompt or model change.
+              </p>
             </div>
-            <div className="flex flex-col gap-2 border border-flag-amber/40 rounded p-3 bg-surface">
-              <div>
-                <h3 className="text-xs font-semibold text-flag-amber">Rebuild everything</h3>
-                <p className="text-[11px] text-text-muted leading-relaxed mt-1">
-                  Wipe every extracted topic / concept / entity / pattern and re-run every conversation through the LLM. Costly — use after a prompt or model change.
-                </p>
-              </div>
-              <button
-                onClick={handleRebuildKg}
-                disabled={!!rebuildBusy || extractionRunning}
-                className="bg-surface hover:bg-flag-amber hover:text-surface disabled:opacity-50 text-flag-amber text-xs px-3 py-2 rounded font-medium transition-colors border border-flag-amber/60 self-start"
-              >
-                {rebuildBusy === 'rebuild_all' ? 'Rebuilding…' : 'Rebuild knowledge graph'}
-              </button>
-            </div>
+            <button
+              onClick={handleRebuildKg}
+              disabled={rebuildBusy || extractionRunning}
+              title={extractionRunning ? 'Stop the current sync before rebuilding' : undefined}
+              className="bg-surface hover:bg-flag-amber hover:text-surface disabled:opacity-50 disabled:cursor-not-allowed text-flag-amber text-xs px-3 py-2 rounded font-medium transition-colors border border-flag-amber/60 self-start"
+            >
+              {rebuildBusy ? 'Rebuilding…' : 'Rebuild knowledge graph'}
+            </button>
           </div>
+          {/* Explain *why* the button is disabled so a user who clicks and sees
+              nothing happen knows to stop the sync first. The earlier behavior
+              looked like the button was broken. */}
+          {extractionRunning && !rebuildBusy && (
+            <p className="text-[11px] text-flag-amber leading-relaxed">
+              Sync is currently running — stop it at the top of this page before Rebuilding, so the new queue isn't racing against in-flight workers.
+            </p>
+          )}
           {rebuildMessage && (
-            <p className="text-[11px] text-text-muted leading-relaxed border-l-2 border-stone-2 pl-2">
+            <p className="text-[11px] text-text-muted leading-relaxed border-l-2 border-stone-2 pl-2 whitespace-pre-wrap break-words">
               {rebuildMessage}
             </p>
           )}
