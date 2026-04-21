@@ -789,12 +789,18 @@ async fn do_extract(
         .ok()
     };
 
+    let mut safe_summary = master_summary;
+    if safe_summary.len() > 15000 {
+        safe_summary.truncate(15000);
+        safe_summary.push_str("\n... [Snippet Truncated to 15000 Chars Limit]");
+    }
+
     let prompt = match prompt_body {
         Some(body) => body
             .replace("{{title}}", &title)
             .replace("{{created}}", &created)
-            .replace("{{messages_with_ids}}", &master_summary),
-        None => default_extraction_prompt(&title, &created, &master_summary),
+            .replace("{{messages_with_ids}}", &safe_summary),
+        None => default_extraction_prompt(&title, &created, &safe_summary),
     };
 
     let t_reduce = Instant::now();
@@ -822,7 +828,7 @@ async fn do_extract(
                 "extract_model": extract_model,
                 "prompt_len": p.len(),
                 "json_mode": true,
-                "max_tokens": 900,
+                "max_tokens": 6000,
             }),
         );
         let response = llm
@@ -835,7 +841,7 @@ async fn do_extract(
                 ChatOpts {
                     temperature: 0.2,
                     json_mode: true,
-                    max_tokens: Some(900),
+                    max_tokens: Some(6000),
                 },
             )
             .await?;

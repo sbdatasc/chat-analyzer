@@ -1,6 +1,8 @@
 use serde::Serialize;
 use rusqlite::Connection;
 use std::collections::HashSet;
+use std::fs::OpenOptions;
+use std::io::Write;
 
 #[derive(Serialize)]
 pub struct Node {
@@ -23,6 +25,30 @@ pub struct GraphData {
     pub nodes: Vec<Node>,
     pub links: Vec<Link>,
 }
+
+// #region agent log
+fn agent_log(hypothesis_id: &str, location: &str, message: &str, data: serde_json::Value) {
+    let payload = serde_json::json!({
+        "sessionId": "a5604b",
+        "runId": "pre-fix",
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)),
+    });
+    if let Ok(mut f) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/Users/saurav/projects/apps/chat-analyzer/.cursor/debug-a5604b.log")
+    {
+        let _ = writeln!(f, "{}", payload.to_string());
+    }
+}
+// #endregion
 
 pub fn get_initial_graph(conn: &Connection) -> Result<GraphData, String> {
     // Seed from recent conversations (the user's primary entry point), then
@@ -47,6 +73,7 @@ pub fn get_initial_graph(conn: &Connection) -> Result<GraphData, String> {
         .collect();
 
     if conv_ids.is_empty() {
+        agent_log("H4", "src-tauri/src/graph.rs:get_initial_graph", "no_conversations_seeded", serde_json::json!({}));
         return Ok(GraphData { nodes: vec![], links: vec![] });
     }
 
@@ -103,6 +130,20 @@ pub fn get_initial_graph(conn: &Connection) -> Result<GraphData, String> {
         included.insert(id.clone());
     }
 
+    agent_log(
+        "H5",
+        "src-tauri/src/graph.rs:get_initial_graph",
+        "seed_and_neighbor_summary",
+        serde_json::json!({
+            "seed_conversations": seed_conversations,
+            "neighbor_cap": neighbor_cap,
+            "seed_count": conv_ids.len(),
+            "seed_preview": conv_ids.iter().take(8).cloned().collect::<Vec<_>>(),
+            "new_neighbors_count": newly_found.len(),
+            "neighbor_preview": newly_found.iter().take(8).cloned().collect::<Vec<_>>(),
+        }),
+    );
+
     // Fetch all included nodes.
     let mut all_ids: Vec<String> = included.iter().cloned().collect();
     all_ids.sort();
@@ -138,6 +179,18 @@ pub fn get_initial_graph(conn: &Connection) -> Result<GraphData, String> {
 
     // Filter links so both endpoints are included.
     links.retain(|l| included.contains(&l.source) && included.contains(&l.target));
+
+    agent_log(
+        "H6",
+        "src-tauri/src/graph.rs:get_initial_graph",
+        "graph_result_fingerprint",
+        serde_json::json!({
+            "node_count": nodes.len(),
+            "link_count": links.len(),
+            "node_preview": nodes.iter().take(8).map(|n| n.id.clone()).collect::<Vec<_>>(),
+            "link_preview": links.iter().take(8).map(|l| format!("{}->{}:{}", l.source, l.target, l.edge_type)).collect::<Vec<_>>(),
+        }),
+    );
 
     eprintln!(
         "[graph] initial_graph nodes={} links={} (seed_cap={} neighbor_cap={})",

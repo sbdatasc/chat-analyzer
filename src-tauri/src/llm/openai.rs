@@ -201,9 +201,9 @@ fn model_is_thinking(name: &str) -> bool {
     if n.contains("thinking") || n.contains("reasoning") {
         return true;
     }
-    // Gemini 2.5 Pro is a thinking model by default; flash variants aren't
-    // unless the name contains `-thinking`.
-    if n.starts_with("gemini-2.5-pro") || n == "gemini-2.5-pro" {
+    // Gemini 2.5 series (both Pro and Flash variants) heavily utilizes
+    // internal structural tokens for chain-of-thought routing.
+    if n.starts_with("gemini-2.5") {
         return true;
     }
     // OpenAI o-series reasoning models.
