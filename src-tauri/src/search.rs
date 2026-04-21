@@ -567,13 +567,25 @@ pub async fn ask_question(
     embed_api_key: Option<String>,
     session: Option<SessionState>,
 ) -> Result<ChatAnswer, String> {
+    if model.trim().is_empty() {
+        return Err("No chat model selected. Configure it in Settings → LLM Routing.".to_string());
+    }
     let client = crate::llm::openai::OpenAiCompatibleClient::new(base_url.clone(), api_key.clone());
+
+    // Only pass an embedding endpoint to search_nodes if the caller actually
+    // supplied one — no hardcoded localhost fallback. If the user hasn't set
+    // up an embedding endpoint, search falls back to FTS-only retrieval.
+    let embed_url = embed_base_url
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let embed_key = embed_api_key.clone().unwrap_or_default();
 
     let graph = search_nodes(
         query.clone(),
         workspace_path.clone(),
-        Some(embed_base_url.clone().unwrap_or_else(|| "http://localhost:11434/v1".to_string())),
-        Some(embed_api_key.clone().unwrap_or_default()),
+        embed_url,
+        Some(embed_key),
         embed_model.clone(),
     )
     .await?;

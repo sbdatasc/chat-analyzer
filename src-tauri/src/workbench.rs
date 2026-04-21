@@ -133,11 +133,15 @@ pub async fn approve_parked_extraction(
     };
 
     let cfg = crate::read_workspace_config(workspace);
-    let embed_model = if cfg.jobs.embedding.model.trim().is_empty() {
-        "nomic-embed-text".to_string()
-    } else {
-        cfg.jobs.embedding.model.clone()
-    };
+    // Read the user's selection literally — no hardcoded fallback. If embedding
+    // isn't configured, surface a clear error instead of silently substituting.
+    let embed_model = cfg.jobs.embedding.model.trim().to_string();
+    if embed_model.is_empty() {
+        return Err("No embedding model selected. Configure it in Settings → LLM Routing (Embedding).".to_string());
+    }
+    if cfg.endpoints.default.base_url.trim().is_empty() {
+        return Err("Local endpoint isn't configured. Set it in Settings → Local LLM before approving parked extractions.".to_string());
+    }
     let embed_client = crate::llm::openai::OpenAiCompatibleClient::new(
         cfg.endpoints.default.base_url.clone(),
         cfg.endpoints.default.api_key.clone(),

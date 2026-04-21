@@ -150,40 +150,31 @@ function App() {
     failed: number;
   } | null>(null);
   const [routingNotice, setRoutingNotice] = useState<string | null>(null);
-  // Cache of models the cloud provider actually serves. The auto-correct
-  // logic prefers this over the hard-coded preset, so stale configs
-  // (e.g. `gemini-2.0-flash` on a v1beta account that doesn't serve it)
-  // get swapped to a model the endpoint definitely has.
-  const [cloudModels, setCloudModels] = useState<string[]>([]);
   const storeRef = useRef<any>(null);
   const extractionAbortRef = useRef<{ stopped: boolean }>({ stopped: false });
   const lastGraphRefreshAtRef = useRef<number>(0);
   const lastGraphSigRef = useRef<string>("");
+  const lastGraphFpRef = useRef<string>("");
 
-  // Re-fetch the cloud provider's model list when credentials change. Filter
-  // out embedding models so chat/extraction defaults never pick `text-embedding-*`.
-  useEffect(() => {
-    const cloud = config?.endpoints.cloud;
-    if (!cloud?.base_url || !cloud?.api_key) {
-      setCloudModels([]);
-      return;
+  const graphFingerprint = useCallback((data: any): string => {
+    try {
+      const nodes = Array.isArray(data?.nodes) ? data.nodes : [];
+      const links = Array.isArray(data?.links) ? data.links : [];
+      const nodeIds = nodes
+        .map((n: any) => String(n?.id ?? ""))
+        .filter(Boolean)
+        .sort()
+        .slice(0, 12);
+      const linkIds = links
+        .map((l: any) => `${String(l?.source ?? "")}->${String(l?.target ?? "")}:${String(l?.edge_type ?? "")}`)
+        .filter((s: string) => s.length > 3)
+        .sort()
+        .slice(0, 12);
+      return `n=${nodes.length}|l=${links.length}|n0=${nodeIds.join(",")}|e0=${linkIds.join(",")}`;
+    } catch {
+      return "fp_error";
     }
-    let cancelled = false;
-    invoke<string[]>("list_available_models", {
-      baseUrl: cloud.base_url,
-      apiKey: cloud.api_key,
-    })
-      .then((m) => {
-        if (cancelled) return;
-        setCloudModels(m.filter((n) => !n.toLowerCase().includes("embed")));
-      })
-      .catch(() => {
-        if (!cancelled) setCloudModels([]);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [config?.endpoints.cloud.base_url, config?.endpoints.cloud.api_key]);
+  }, []);
 
   const getEndpoint = useCallback(
     (id: string): EndpointConfig | null => {
@@ -192,141 +183,73 @@ function App() {
         return c && c.base_url && c.api_key ? c : null;
       }
       if (id === 'default' || id === 'local' || id === '') {
-        return config?.endpoints.default ?? { base_url: 'http://localhost:11434/v1', api_key: '', label: 'Local' };
+        const d = config?.endpoints.default;
+        return d && d.base_url ? d : null;
       }
       return null;
     },
     [config]
   );
 
-  // Build [primary, ...fallbacks] for a job using the explicit preferred +
-  // backup config. An empty backup_endpoint means "no backup": the job fails
-  // hard on a preferred-endpoint error. Targets are deduped so a misconfigured
-  // "backup = preferred" doesn't retry against itself.
+  // Build [primary, ...backup] targets using *exactly* what the user selected
+  // in Settings. No heuristics, no auto-substitution, no hardcoded fallbacks.
+  // If an endpoint is unconfigured or a model is empty, that target is dropped
+  // and a clear notice is returned for the caller to surface.
   const resolveJobTargets = useCallback(
-    (jobKey: JobKey, job: JobConfig): { targets: Target[]; notice: string | null } => {
-      const cloudProvider = inferCloudProvider(config?.endpoints.cloud);
-
-      // Live list from the provider's /models endpoint, filtered. If empty
-      // (never fetched / fetch failed), we fall back to the hardcoded preset,
-      // which may or may not actually exist on the account.
-      const liveCloudList = cloudModels;
-
-      // Pick a cloud model we know the provider serves. Preference order:
-      //   1. The hardcoded preset if it's in the live list.
-      //   2. The first live-listed model.
-      //   3. The preset (last resort — may still 404 but it's our best guess).
-      const cloudFallbackModel = (): string => {
-        const preset = defaultModelForJob(jobKey, 'cloud', config);
-        if (preset && liveCloudList.includes(preset)) return preset;
-        if (liveCloudList.length > 0) return liveCloudList[0];
-        return preset;
-      };
-
-      const corrections: string[] = [];
-      const makeTarget = (epId: string, rawModel: string, role: 'preferred' | 'backup'): Target | null => {
+    (_jobKey: JobKey, job: JobConfig): { targets: Target[]; notice: string | null } => {
+      const makeTarget = (epId: string, rawModel: string): Target | null => {
         const ep = getEndpoint(epId);
         if (!ep) return null;
-        const kind = epId === 'cloud' ? 'cloud' : 'default';
+        const model = (rawModel || '').trim();
+        if (!model) return null;
+        const kind: 'cloud' | 'default' = epId === 'cloud' ? 'cloud' : 'default';
 
-        // Auto-correct a model that's obviously wrong for this endpoint.
-        // This is the guardrail against stale configs like "endpoint=cloud,
-        // model=qwen2.5:3b" — a local Ollama tag being sent to Gemini — and
-        // also against preset names the provider no longer serves.
-        let model = rawModel.trim();
-        if (kind === 'cloud' && !model) {
-          const corrected = cloudFallbackModel();
-          if (!corrected) return null;
-          corrections.push(`${role} model is empty for Cloud — using "${corrected}" instead.`);
-          model = corrected;
-        } else if (kind === 'cloud' && cloudProvider !== 'custom' && modelLooksLocal(model)) {
-          const corrected = cloudFallbackModel();
-          if (!corrected) return null;
-          corrections.push(
-            `${role} model "${model}" isn't compatible with Cloud — using "${corrected}" instead.`
-          );
-          model = corrected;
-        } else if (
-          kind === 'cloud' &&
-          cloudProvider !== 'custom' &&
-          liveCloudList.length > 0 &&
-          !liveCloudList.includes(model)
-        ) {
-          // The user's configured model isn't in the provider's /models
-          // list. Substitute something that actually exists before we burn
-          // a round-trip on a guaranteed 404.
-          const corrected = cloudFallbackModel();
-          if (corrected && corrected !== model) {
-            corrections.push(
-              `${role} model "${model}" isn't served by the current Cloud provider — using "${corrected}" instead.`
-            );
-            model = corrected;
-          }
-        } else if (kind === 'default' && modelLooksCloud(model)) {
-          const corrected = defaultModelForJob(jobKey, 'default', config);
-          corrections.push(
-            `${role} model "${model}" is a cloud-only name on a Local endpoint — using "${corrected}" instead.`
-          );
-          model = corrected;
-        } else if (kind === 'default' && !model) {
-          model = defaultModelForJob(jobKey, 'default', config);
-        }
-
-        // Triage must live on the same client as extraction (backend uses one
-        // client for both). On cloud, reuse the (possibly corrected) model;
-        // on local, prefer the user's cheaper triage model, but if it's a
-        // cloud name, fall back to a local default too.
+        // Triage shares the chat client in the backend, so it has to be a
+        // model the SAME endpoint serves. On cloud, reuse the extraction
+        // model (user's chosen one). On local, honor the user's triage
+        // selection; empty = reuse extraction model.
         let triage: string;
         if (kind === 'cloud') {
           triage = model;
         } else {
-          triage = normalizeModelForTarget(
-            'triage_preview',
-            'default',
-            config?.jobs.triage_preview.model || '',
-            config
-          );
+          const configuredTriage = (config?.jobs.triage_preview.model || '').trim();
+          triage = configuredTriage || model;
         }
 
         return { ep, model, triage, kind };
       };
 
-      const primary = makeTarget(job.endpoint || 'default', job.model, 'preferred');
-      let notice: string | null = null;
       const out: Target[] = [];
+      const notes: string[] = [];
 
+      const endpointId = job.endpoint || 'default';
+      const primary = makeTarget(endpointId, job.model || '');
       if (primary) {
         out.push(primary);
       } else {
-        // User picked cloud but hasn't configured it. Fall back silently to
-        // local so the app keeps working, and tell them why.
-        const localPrimary = makeTarget('default', defaultModelForJob(jobKey, 'default', config), 'preferred');
-        if (localPrimary) out.push(localPrimary);
-        notice = isCloudConfigured(config)
-          ? "Cloud routing is selected but no runnable cloud model is set — running on the local LLM instead. Pick a cloud model in Settings -> LLM Routing to switch."
-          : "Cloud endpoint isn't configured — running on the local LLM instead. Add an API key in Settings -> Cloud to switch.";
-      }
-
-      // Backup target (user-configured explicit preference). Skip if empty,
-      // equal to primary's endpoint, or unreachable.
-      if (job.backup_endpoint && job.backup_endpoint !== 'none') {
-        const backup = makeTarget(job.backup_endpoint, job.backup_model || '', 'backup');
-        if (backup && !out.some((t) => t.ep.base_url === backup.ep.base_url && t.model === backup.model)) {
-          out.push(backup);
+        const epLabel = endpointId === 'cloud' ? 'Cloud' : 'Local';
+        if (endpointId === 'cloud' && !isCloudConfigured(config)) {
+          notes.push("Cloud isn't configured — add an API key in Settings → Cloud.");
+        } else if (!(job.model || '').trim()) {
+          notes.push(`No ${epLabel} model selected — pick one in Settings → LLM Routing.`);
+        } else {
+          notes.push(`${epLabel} endpoint isn't available — check Settings → ${epLabel} LLM.`);
         }
       }
 
-      // Roll up any auto-corrections into a single notice so the user knows
-      // the app substituted a model — it's the difference between "silently
-      // changed your config" and "protected you from a 404."
-      if (corrections.length > 0) {
-        const correctionNotice = `Model config auto-corrected: ${corrections.join(' ')} Update Settings → LLM Routing if you want different models.`;
-        notice = notice ? `${notice} ${correctionNotice}` : correctionNotice;
+      if (job.backup_endpoint && job.backup_endpoint !== 'none') {
+        const backup = makeTarget(job.backup_endpoint, job.backup_model || '');
+        if (backup && !out.some((t) => t.ep.base_url === backup.ep.base_url && t.model === backup.model)) {
+          out.push(backup);
+        } else if (!backup) {
+          const epLabel = job.backup_endpoint === 'cloud' ? 'Cloud' : 'Local';
+          notes.push(`Backup ${epLabel} has no model selected — pick one in Settings → LLM Routing.`);
+        }
       }
 
-      return { targets: out, notice };
+      return { targets: out, notice: notes.length > 0 ? notes.join(' ') : null };
     },
-    [config, getEndpoint, cloudModels]
+    [config, getEndpoint]
   );
 
   const stopExtraction = useCallback(() => {
@@ -372,7 +295,7 @@ function App() {
         // resolver returns a local target + a human-readable notice.
         const { targets: configuredTargets, notice: resolveNotice } = resolveJobTargets(
           'extraction',
-          config?.jobs.extraction ?? { endpoint: 'default', model: LOCAL_JOB_DEFAULTS.extraction }
+          config?.jobs.extraction ?? { endpoint: '', model: '' }
         );
         agentLog("E", "src/App.tsx:runExtractionWorker", "configured_targets", {
           source,
@@ -387,12 +310,21 @@ function App() {
         });
         if (resolveNotice) setRoutingNotice(resolveNotice);
         if (configuredTargets.length === 0) {
-          throw new Error("No runnable endpoint for extraction. Configure one in Settings.");
+          throw new Error("No runnable endpoint for extraction. Configure one in Settings → LLM Routing.");
         }
-        // Embedding always goes to Local: the workspace vec table is
+        // Embedding stays on the Local endpoint: the workspace vec table is
         // dimensioned for 768-dim nomic-embed-text, and a cloud provider
-        // wouldn't serve that model even if reachable.
-        const embedEndpoint = config?.endpoints.default ?? { base_url: 'http://localhost:11434/v1', api_key: '', label: 'Local' };
+        // wouldn't serve that model. If either the Local endpoint or the
+        // embedding model isn't configured, fail fast rather than substitute
+        // a hardcoded URL / model name.
+        const embedEndpoint = config?.endpoints.default;
+        const embedModelName = (config?.jobs.embedding.model || '').trim();
+        if (!embedEndpoint?.base_url) {
+          throw new Error("Local endpoint isn't configured. Set it in Settings → Local LLM before syncing.");
+        }
+        if (!embedModelName) {
+          throw new Error("No embedding model selected. Pick one in Settings → LLM Routing (Embedding).");
+        }
 
         // Sticky fallback: once any worker proves the primary target is
         // broken, the rest of the run skips straight to the backup. Avoids
@@ -407,18 +339,18 @@ function App() {
             targetKind: t.kind,
             model: t.model,
             triage: t.triage,
-            baseUrl: t.ep.base_url || "http://localhost:11434/v1",
-            embedBaseUrl: embedEndpoint.base_url || "http://localhost:11434/v1",
+            baseUrl: t.ep.base_url,
+            embedBaseUrl: embedEndpoint.base_url,
           });
           return invoke("extract_conversation", {
             conversationId: id,
             workspacePath: workspace,
-            baseUrl: t.ep.base_url || "http://localhost:11434/v1",
+            baseUrl: t.ep.base_url,
             apiKey: t.ep.api_key || "",
             model: t.model,
-            embedModel: config?.jobs.embedding.model || "nomic-embed-text",
+            embedModel: embedModelName,
             triageModel: t.triage,
-            embedBaseUrl: embedEndpoint.base_url || "http://localhost:11434/v1",
+            embedBaseUrl: embedEndpoint.base_url,
             embedApiKey: embedEndpoint.api_key || "",
           });
         };
@@ -571,11 +503,7 @@ function App() {
           setWorkspace(savedWorkspace);
           try {
             const cfg = await invoke<WorkspaceConfig>("get_workspace_config", { workspacePath: savedWorkspace });
-            const normalized = normalizeWorkspaceConfig(cfg);
-            setConfig(normalized);
-            if (JSON.stringify(normalized) !== JSON.stringify(cfg)) {
-              await invoke("update_workspace_config", { workspacePath: savedWorkspace, config: normalized });
-            }
+            setConfig(cfg);
           } catch(e) {
             console.error("Failed to load workspace.yaml:", e);
           }
@@ -590,10 +518,11 @@ function App() {
   }, []);
 
   const updateConfig = useCallback(async (newConfig: WorkspaceConfig) => {
-    const normalized = normalizeWorkspaceConfig(newConfig);
-    setConfig(normalized);
+    // Save the config verbatim — no normalization, no silent model substitution.
+    // Whatever the user picks in Settings is what gets persisted and used.
+    setConfig(newConfig);
     if (workspace) {
-      await invoke("update_workspace_config", { workspacePath: workspace, config: normalized });
+      await invoke("update_workspace_config", { workspacePath: workspace, config: newConfig });
     }
   }, [workspace]);
 
@@ -607,6 +536,11 @@ function App() {
           } else {
             setHasArchive(true);
             lastGraphSigRef.current = `${data.nodes?.length ?? 0}:${data.links?.length ?? 0}`;
+            lastGraphFpRef.current = graphFingerprint(data);
+            agentLog("H1", "src/App.tsx:initial_graph", "initial_graph_loaded", {
+              sig: lastGraphSigRef.current,
+              fp: lastGraphFpRef.current,
+            });
             setGraphData(data);
           }
         })
@@ -615,7 +549,7 @@ function App() {
           setHasArchive(false);
         });
     }
-  }, [workspace, setupMode]);
+  }, [workspace, setupMode, graphFingerprint]);
 
   // While extraction is running, poll for graph updates so newly committed
   // nodes/edges appear without waiting for a full page reload or worker finish.
@@ -626,8 +560,23 @@ function App() {
         .then((data: any) => {
           if (data && data.nodes && data.nodes.length > 0) {
             const sig = `${data.nodes?.length ?? 0}:${data.links?.length ?? 0}`;
-            if (sig === lastGraphSigRef.current) return;
+            const fp = graphFingerprint(data);
+            if (sig === lastGraphSigRef.current) {
+              if (fp !== lastGraphFpRef.current) {
+                agentLog("H1", "src/App.tsx:poll_graph", "poll_skipped_same_counts_but_fingerprint_changed", {
+                  sig,
+                  prevFp: lastGraphFpRef.current,
+                  nextFp: fp,
+                });
+                lastGraphFpRef.current = fp;
+              } else {
+                agentLog("H2", "src/App.tsx:poll_graph", "poll_skipped_same_sig_and_fp", { sig, fp });
+              }
+              return;
+            }
             lastGraphSigRef.current = sig;
+            lastGraphFpRef.current = fp;
+            agentLog("H3", "src/App.tsx:poll_graph", "poll_applied_graph_update", { sig, fp });
             setHasArchive(true);
             setGraphData(data);
           }
@@ -635,7 +584,7 @@ function App() {
         .catch(() => {});
     }, 2500);
     return () => clearInterval(id);
-  }, [workspace, setupMode, extractionRunning]);
+  }, [workspace, setupMode, extractionRunning, graphFingerprint]);
 
   useEffect(() => {
     if (workspace && hasArchive === false) {
@@ -707,11 +656,7 @@ function App() {
         // let the empty-archive screen guide them (import JSON / configure LLMs).
         try {
           const cfg = await invoke<WorkspaceConfig>("get_workspace_config", { workspacePath: path });
-          const normalized = normalizeWorkspaceConfig(cfg);
-          setConfig(normalized);
-          if (JSON.stringify(normalized) !== JSON.stringify(cfg)) {
-            await invoke("update_workspace_config", { workspacePath: path, config: normalized });
-          }
+          setConfig(cfg);
         } catch (e) {
           console.error("Failed to load workspace.yaml:", e);
         }
@@ -854,31 +799,51 @@ function App() {
 
     const { targets: chatTargets, notice: chatNotice } = resolveJobTargets(
       'chat',
-      config?.jobs.chat ?? { endpoint: 'default', model: LOCAL_JOB_DEFAULTS.chat }
+      config?.jobs.chat ?? { endpoint: '', model: '' }
     );
     if (chatNotice) setRoutingNotice(chatNotice);
     if (chatTargets.length === 0) {
       setMessages((prev) => [
         ...prev,
-        { id: (Date.now() + 1).toString(), role: 'assistant', text: 'No runnable endpoint for chat. Configure one in Settings.' },
+        {
+          id: (Date.now() + 1).toString(),
+          role: 'assistant',
+          text: chatNotice || 'No chat model selected. Configure one in Settings → LLM Routing (Chat).',
+        },
       ]);
       setIsChatLoading(false);
       return;
     }
-    // Embedding stays local regardless of chat endpoint — the workspace vec
-    // table is 768-dim / nomic-embed-text and cloud providers don't serve
-    // that model.
-    const embedEndpoint = config?.endpoints.default ?? { base_url: 'http://localhost:11434/v1', api_key: '', label: 'Local' };
+
+    // Embedding stays on the Local endpoint regardless of chat endpoint — the
+    // workspace vec table is 768-dim nomic-embed-text and cloud providers
+    // don't serve that model. Fail fast if the user hasn't configured it.
+    const embedEndpoint = config?.endpoints.default;
+    const embedModelName = (config?.jobs.embedding.model || '').trim();
+    if (!embedEndpoint?.base_url || !embedModelName) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: (Date.now() + 1).toString(),
+          role: 'assistant',
+          text: !embedEndpoint?.base_url
+            ? 'Local endpoint isn\'t configured. Set it in Settings → Local LLM before chatting.'
+            : 'No embedding model selected. Pick one in Settings → LLM Routing (Embedding).',
+        },
+      ]);
+      setIsChatLoading(false);
+      return;
+    }
 
     const callChat = async (t: Target) =>
       invoke("ask_question", {
         query,
         workspacePath: workspace,
-        baseUrl: t.ep.base_url || "http://localhost:11434/v1",
+        baseUrl: t.ep.base_url,
         apiKey: t.ep.api_key || "",
         model: t.model,
-        embedModel: config?.jobs.embedding.model || "nomic-embed-text",
-        embedBaseUrl: embedEndpoint.base_url || "http://localhost:11434/v1",
+        embedModel: embedModelName,
+        embedBaseUrl: embedEndpoint.base_url,
         embedApiKey: embedEndpoint.api_key || "",
         session: {
           active_frame: activeFrame,
