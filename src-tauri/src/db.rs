@@ -106,6 +106,22 @@ pub fn init_db<P: AsRef<Path>>(db_path: P, vec_dim: usize) -> Result<Connection>
         CREATE INDEX IF NOT EXISTS idx_msg_conv ON message_index(conversation_id);
         CREATE INDEX IF NOT EXISTS idx_msg_src ON message_index(source_id);
 
+        -- Conversation-level cache of user-authored messages, materialized
+        -- during ingest so KG extraction can read one row instead of
+        -- rehydrating every message on demand.
+        CREATE TABLE IF NOT EXISTS conversation_user_cache (
+            conversation_id   TEXT PRIMARY KEY,
+            source_id         TEXT NOT NULL,
+            user_messages     BLOB NOT NULL, -- Zstd compressed JSON array
+            user_message_count INTEGER NOT NULL DEFAULT 0,
+            char_count        INTEGER NOT NULL DEFAULT 0,
+            updated_at        TEXT NOT NULL,
+            FOREIGN KEY (conversation_id) REFERENCES node(id) ON DELETE CASCADE,
+            FOREIGN KEY (source_id) REFERENCES source_registry(source_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_conv_user_cache_src
+            ON conversation_user_cache(source_id);
+
         -- Multi-source presence tracking
         CREATE TABLE IF NOT EXISTS conversation_sources (
             conversation_id  TEXT NOT NULL,

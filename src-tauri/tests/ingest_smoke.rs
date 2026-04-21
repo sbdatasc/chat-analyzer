@@ -47,6 +47,24 @@ fn seed_conversation(
         ],
     )
     .unwrap();
+    let cached_messages = serde_json::json!([{
+        "message_id": message_id,
+        "create_time": 1.0,
+        "on_visible_path": true,
+        "text": text,
+    }]);
+    conn.execute(
+        "INSERT INTO conversation_user_cache (
+            conversation_id, source_id, user_messages, user_message_count, char_count, updated_at
+         ) VALUES (?1, 'src-1', ?2, 1, ?3, ?4)",
+        rusqlite::params![
+            conversation_id,
+            encode_all(cached_messages.to_string().as_bytes(), 3).unwrap(),
+            text.len() as i64,
+            now,
+        ],
+    )
+    .unwrap();
 }
 
 fn embedding_for(input: &str) -> Vec<f32> {
@@ -165,6 +183,10 @@ fn end_to_end_ingest_populates_tables() {
     assert_eq!(count_sr, 1);
     assert_eq!(count_conv, 2, "two conversation nodes");
     assert_eq!(count_msg, 3, "only user-authored messages are indexed");
+    let transcript_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM conversation_user_cache", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(transcript_count, 2, "each conversation gets one cached user transcript");
 
     // Visible-path walk covers the user-authored visible path.
     let visible: i64 = conn

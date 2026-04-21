@@ -22,6 +22,14 @@ const SOLID_THRESHOLD: f64 = 0.85;
 // local models we target.
 const SINGLE_PASS_THRESHOLD: usize = 45_000;
 
+#[derive(serde::Deserialize)]
+struct StoredUserMessage {
+    message_id: String,
+    create_time: f64,
+    on_visible_path: bool,
+    text: String,
+}
+
 // #region agent log
 const DEBUG_LOG_PATH: &str = "/Users/saurav/projects/apps/chat-analyzer/.cursor/debug-a5604b.log";
 fn agent_log(hypothesis_id: &str, location: &str, message: &str, data: Value) {
@@ -208,6 +216,55 @@ fn parse_json_response(text: &str) -> Result<Value> {
     }
 
     Err(anyhow!("no parseable JSON object in model response"))
+}
+
+fn load_conversation_user_messages(
+    db: &Connection,
+    conversation_id: &str,
+) -> Result<Vec<StoredUserMessage>> {
+    let cached_blob: Option<Vec<u8>> = db
+        .query_row(
+            "SELECT user_messages FROM conversation_user_cache WHERE conversation_id = ?1",
+            params![conversation_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+
+    if let Some(blob) = cached_blob {
+        let decompressed = zstd::stream::decode_all(&blob[..]).unwrap_or_default();
+        let mut messages: Vec<StoredUserMessage> = serde_json::from_slice(&decompressed)
+            .map_err(|e| anyhow!("invalid cached conversation transcript: {}", e))?;
+        messages.sort_by(|a, b| {
+            a.create_time
+                .total_cmp(&b.create_time)
+                .then_with(|| a.message_id.cmp(&b.message_id))
+        });
+        return Ok(messages);
+    }
+
+    let mut stmt = db.prepare(
+        "SELECT message_id, text_content, create_time, on_visible_path
+         FROM message_index
+         WHERE conversation_id = ?1 AND role = 'user'
+         ORDER BY create_time ASC",
+    )?;
+    let mut rows = stmt.query(params![conversation_id])?;
+    let mut messages = Vec::new();
+    while let Some(row) = rows.next()? {
+        let message_id: String = row.get(0)?;
+        let blob: Vec<u8> = row.get(1)?;
+        let create_time: f64 = row.get::<_, Option<f64>>(2)?.unwrap_or(0.0);
+        let on_visible_path: i64 = row.get(3)?;
+        let decompressed = zstd::stream::decode_all(&blob[..]).unwrap_or_default();
+        let text = String::from_utf8(decompressed).unwrap_or_default();
+        messages.push(StoredUserMessage {
+            message_id,
+            create_time,
+            on_visible_path: on_visible_path == 1,
+            text,
+        });
+    }
+    Ok(messages)
 }
 
 fn canonical_edge_type(kind: &str) -> &'static str {
@@ -606,35 +663,24 @@ async fn do_extract(
             params![conversation_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
-        let mut stmt = db.prepare(
-            "SELECT message_id, text_content, role FROM message_index
-             WHERE conversation_id = ?1 AND role = 'user' AND on_visible_path = 1
-             ORDER BY create_time ASC",
-        )?;
-        let mut rows = stmt.query(params![conversation_id])?;
-        
+        let messages = load_conversation_user_messages(&db, conversation_id)?;
+
         let mut chunks = Vec::new();
         let mut current_chunk = String::new();
-        
-        while let Some(row) = rows.next()? {
-            let msg_id: String = row.get(0)?;
-            let blob: Vec<u8> = row.get(1)?;
-            let role: String = row.get(2)?;
-            let decompressed = zstd::stream::decode_all(&blob[..]).unwrap_or_default();
-            if let Ok(text) = String::from_utf8(decompressed) {
-                let snippet = if text.len() > MAX_MSG_SNIPPET {
-                    format!("{}…", &text[..MAX_MSG_SNIPPET])
-                } else {
-                    text
-                };
-                let chunk_str = format!("[{}] {}:\n{}\n\n", msg_id, role, snippet);
-                
-                if current_chunk.len() + chunk_str.len() > CHUNK_SIZE_CHARS && !current_chunk.is_empty() {
-                    chunks.push(current_chunk.clone());
-                    current_chunk.clear();
-                }
-                current_chunk.push_str(&chunk_str);
+
+        for msg in messages.into_iter().filter(|m| m.on_visible_path) {
+            let snippet = if msg.text.len() > MAX_MSG_SNIPPET {
+                format!("{}…", &msg.text[..MAX_MSG_SNIPPET])
+            } else {
+                msg.text
+            };
+            let chunk_str = format!("[{}] user:\n{}\n\n", msg.message_id, snippet);
+
+            if current_chunk.len() + chunk_str.len() > CHUNK_SIZE_CHARS && !current_chunk.is_empty() {
+                chunks.push(current_chunk.clone());
+                current_chunk.clear();
             }
+            current_chunk.push_str(&chunk_str);
         }
         if !current_chunk.is_empty() {
             chunks.push(current_chunk);

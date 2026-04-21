@@ -86,7 +86,7 @@ export function inferCloudProvider(cloud: EndpointConfig | null | undefined): Cl
   return url ? "custom" : "gemini";
 }
 
-function summarizeRoutingFailure(err: unknown): string {
+function analyzeRoutingFailure(err: unknown): { summary: string; stickyBackup: boolean } {
   const text = String(err).replace(/\s+/g, " ").trim();
   const lower = text.toLowerCase();
   const model =
@@ -94,19 +94,66 @@ function summarizeRoutingFailure(err: unknown): string {
     text.match(/model(?:s)?[/"'`\s:]+([^"'`\s,.)\]}]+)/i)?.[1];
 
   if ((lower.includes("http 404") || lower.includes("not found")) && model) {
-    return `That endpoint doesn't have the model "${model}". Pick a model that exists on that provider in Settings -> LLM Routing.`;
+    return {
+      summary: `That endpoint doesn't have the model "${model}". Pick a model that exists on that provider in Settings -> LLM Routing.`,
+      stickyBackup: true,
+    };
   }
-  if (lower.includes("http 401") || lower.includes("unauthorized") || lower.includes("invalid api key")) {
-    return "The primary target rejected its API key. Check Settings -> Cloud.";
+  if (lower.includes("http 404") || lower.includes("not found")) {
+    return {
+      summary: "The primary target returned 404 Not Found. Check the endpoint URL and selected model in Settings -> LLM Routing.",
+      stickyBackup: true,
+    };
+  }
+  if (
+    lower.includes("http 401") ||
+    lower.includes("http 403") ||
+    lower.includes("unauthorized") ||
+    lower.includes("invalid api key")
+  ) {
+    return {
+      summary: "The primary target rejected its API key. Check Settings -> Cloud.",
+      stickyBackup: true,
+    };
   }
   if (lower.includes("http 429") || lower.includes("rate limit") || lower.includes("quota")) {
-    return "The primary target hit a rate limit or quota cap.";
+    return {
+      summary: "The primary target hit a rate limit or quota cap.",
+      stickyBackup: true,
+    };
   }
-  if (lower.includes("connect") || lower.includes("network") || lower.includes("dns") || lower.includes("timed out")) {
-    return "The primary target couldn't be reached over the network.";
+  if (
+    (lower.includes("http 400") || lower.includes("bad request")) &&
+    (lower.includes("response_format") || lower.includes("json_object") || lower.includes("unsupported"))
+  ) {
+    return {
+      summary: "The primary target rejected the requested JSON response format. Pick a compatible model or endpoint in Settings -> LLM Routing.",
+      stickyBackup: true,
+    };
+  }
+  if (
+    lower.includes("error sending request for url") ||
+    lower.includes("network error reaching") ||
+    lower.includes("connect") ||
+    lower.includes("network") ||
+    lower.includes("dns") ||
+    lower.includes("timed out") ||
+    lower.includes("timeout") ||
+    lower.includes("connection reset")
+  ) {
+    return {
+      summary: "The primary target had a temporary network problem.",
+      stickyBackup: false,
+    };
+  }
+  if (lower.includes("foreign key constraint failed") || lower.includes("sqlite") || lower.includes("database")) {
+    return {
+      summary: "The workspace database write failed locally, so switching endpoints will not help.",
+      stickyBackup: false,
+    };
   }
 
-  return text.slice(0, 140);
+  return { summary: text.slice(0, 140), stickyBackup: false };
 }
 
 // #region agent log
@@ -326,12 +373,13 @@ function App() {
           throw new Error("No embedding model selected. Pick one in Settings → LLM Routing (Embedding).");
         }
 
-        // Sticky fallback: once any worker proves the primary target is
-        // broken, the rest of the run skips straight to the backup. Avoids
-        // N×pending cloud timeouts when the primary is hard-down.
+        // Sticky fallback only after hard endpoint/config failures. Transient
+        // transport misses should use the backup for the current conversation
+        // only, then keep the rest of the queue on the preferred target.
         let usingBackup = false;
         let fallbackNoticed = false;
         let fallbackTriggerError: string | null = null;
+        let transientFallbackNoticed = false;
 
         const runTarget = async (t: Target, id: string) => {
           agentLog("A", "src/App.tsx:runTarget", "invoke_extract_conversation", {
@@ -391,18 +439,31 @@ function App() {
                   isPrimary: !usingBackup && ti === 0,
                 });
                 errs.push(`${t.kind}(${t.model}): ${String(e).slice(0, 300)}`);
-                // First primary-target failure flips the rest of the run to
-                // backup, and surfaces *why* once (not per-conversation).
+                const failurePolicy = analyzeRoutingFailure(e);
+                // Only hard endpoint/config failures flip the rest of the run
+                // to backup. Transient network misses should fall back for the
+                // current conversation only and then keep trying the primary.
                 const isPrimary = !usingBackup && ti === 0;
                 if (isPrimary && configuredTargets.length > 1) {
-                  usingBackup = true;
-                  fallbackTriggerError = `${t.kind}(${t.model}): ${String(e).slice(0, 300)}`;
-                  if (!fallbackNoticed) {
-                    fallbackNoticed = true;
+                  if (failurePolicy.stickyBackup) {
+                    usingBackup = true;
+                    fallbackTriggerError = `${t.kind}(${t.model}): ${String(e).slice(0, 300)}`;
+                    if (!fallbackNoticed) {
+                      fallbackNoticed = true;
+                      setRoutingNotice(
+                        `Primary extraction target failed — switching the rest of this sync to your backup. ${failurePolicy.summary}`
+                      );
+                      agentLog("C", "src/App.tsx:worker", "switched_to_backup", {
+                        conversationId: id,
+                        err: String(e).slice(0, 500),
+                      });
+                    }
+                  } else if (!transientFallbackNoticed) {
+                    transientFallbackNoticed = true;
                     setRoutingNotice(
-                      `Primary extraction target failed — switching the rest of this sync to your backup. ${summarizeRoutingFailure(e)}`
+                      `Primary extraction target failed for one conversation, so this item is trying your backup while the rest of the sync stays on the primary target. ${failurePolicy.summary}`
                     );
-                    agentLog("C", "src/App.tsx:worker", "switched_to_backup", {
+                    agentLog("C", "src/App.tsx:worker", "kept_primary_after_transient_failure", {
                       conversationId: id,
                       err: String(e).slice(0, 500),
                     });
